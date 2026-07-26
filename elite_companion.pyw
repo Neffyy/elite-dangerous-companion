@@ -30,7 +30,7 @@ TICK_INTERVAL_MS = 1000
 # Bump both of these together whenever a real change is pushed to the repo —
 # the app compares its own APP_VERSION against the VERSION file living at
 # the repo root to know when a newer copy is available.
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.1.0"
 APP_REPO = "Neffyy/elite-dangerous-companion"
 APP_REPO_URL = f"https://github.com/{APP_REPO}"
 APP_VERSION_URL = f"https://raw.githubusercontent.com/{APP_REPO}/main/VERSION"
@@ -519,6 +519,51 @@ ACTIVITY_HUBS = {
     "engineering": "Deciat",
 }
 
+# Guide "For My Ships" personalization: which owned-ship hull stat is the
+# relevant real proxy for each activity (pulled straight from coriolis-data's
+# slots block, since fitted loadouts aren't known for ships other than the
+# one currently being flown), and where its navigation suggestion should come
+# from. Exploration/Mining get a real specific destination; everything else
+# with a nav section gets a general nearby hub; Powerplay/CQC get neither —
+# Powerplay depends on an unknown pledged Power, CQC has no galaxy location.
+PATH_STAT_CATEGORY = {
+    "trading": "cargo", "mining": "cargo", "missions": "cargo", "engineering": "cargo",
+    "combat": "hardpoint", "piracy": "hardpoint", "war_support": "hardpoint",
+    "thargoid_war": "hardpoint",
+    "exploration": "fsd",
+}
+STAT_CATEGORY_LABEL = {
+    "cargo": "internal-slot capacity",
+    "hardpoint": "hardpoint capacity",
+    "fsd": "Frame Shift Drive class",
+}
+PATH_NAV_MODE = {
+    "exploration": "unexplored", "mining": "material",
+    "trading": "hub", "missions": "hub", "combat": "hub", "piracy": "hub",
+    "war_support": "hub", "thargoid_war": "hub", "engineering": "hub",
+}
+MINING_NAV_COMMODITY = "Painite"
+
+
+def ship_stat_score(ship, category):
+    """Real hull-capacity proxy pulled straight from a coriolis-data ship's
+    slots block — not a fabricated stat. "fsd" is the Frame Shift Drive
+    standard-slot class (the primary driver of jump range), "hardpoint" is
+    the sum of hardpoint slot sizes, "cargo" is the sum of internal slot
+    classes (special slots like Military report their size via "class")."""
+    slots = ship.get("slots", {})
+    if category == "fsd":
+        standard = slots.get("standard") or []
+        return standard[2] if len(standard) > 2 else 0
+    if category == "hardpoint":
+        return sum(slots.get("hardpoints") or [])
+    if category == "cargo":
+        total = 0
+        for spec in slots.get("internal") or []:
+            total += spec.get("class", 0) if isinstance(spec, dict) else (spec or 0)
+        return total
+    return 0
+
 
 def estimate_tier(credits):
     if credits is None:
@@ -601,7 +646,7 @@ SAMPLE_EVENTS = [
     {"timestamp": "2026-07-24T10:00:03Z", "event": "Location", "StarSystem": "Shinrarta Dezhra",
      "Docked": True, "StationName": "Jameson Memorial"},
     {"timestamp": "2026-07-24T10:00:04Z", "event": "Loadout", "Ship": "cobramkiii",
-     "MaxJumpRange": 20.7, "Modules": [
+     "MaxJumpRange": 20.7, "CargoCapacity": 22, "Modules": [
          {"Slot": "PowerPlant", "Item": "int_powerplant_size4_class3", "On": True, "Priority": 1, "Health": 1.0},
          {"Slot": "MainEngines", "Item": "int_engine_size4_class3", "On": True, "Priority": 1, "Health": 1.0},
          {"Slot": "FrameShiftDrive", "Item": "int_hyperdrive_size4_class3", "On": True, "Priority": 1, "Health": 1.0},
@@ -614,6 +659,17 @@ SAMPLE_EVENTS = [
     {"timestamp": "2026-07-24T10:00:05Z", "event": "StoredModules", "StationName": "Jameson Memorial",
      "Items": [
          {"Name": "int_cargorack_size2_class1", "StorageSlot": 1, "StarSystem": "Shinrarta Dezhra"},
+     ]},
+    {"timestamp": "2026-07-24T10:00:06Z", "event": "StoredShips", "StationName": "Jameson Memorial",
+     "StarSystem": "Shinrarta Dezhra",
+     "ShipsHere": [
+         {"ShipID": 2, "ShipType": "hauler", "Name": "HAULY", "Value": 250000, "Hot": False},
+     ],
+     "ShipsRemote": [
+         {"ShipID": 3, "ShipType": "anaconda", "Name": "BIG BOI", "Value": 150000000, "Hot": False,
+          "StarSystem": "Eravate", "ShipMarketID": 128666762, "TransferPrice": 50000, "TransferTime": 600},
+         {"ShipID": 4, "ShipType": "vulture", "Name": "", "Value": 6000000, "Hot": False,
+          "StarSystem": "Eravate", "ShipMarketID": 128666762, "TransferPrice": 12000, "TransferTime": 300},
      ]},
     {"timestamp": "2026-07-24T10:05:00Z", "event": "MarketBuy", "Type": "gold",
      "Count": 50, "BuyPrice": 9200, "TotalCost": 460000},
@@ -690,6 +746,8 @@ def new_state():
         "buckets": {"Trading": 0, "Combat": 0, "Exploration": 0, "Missions": 0, "Other": 0},
         "equipped_modules": {},   # slot name -> item symbol (current ship only)
         "stored_modules": set(),  # item symbols sitting unused in Storage, galaxy-wide
+        "cargo_capacity": None,   # current ship only, from Loadout
+        "owned_ships": [],        # [{"ship_internal": str, "system": str|None}, ...] from StoredShips
     }
 
 
@@ -799,6 +857,8 @@ class JournalWatcher:
             self.state["ship_internal"] = e.get("Ship") or self.state["ship_internal"]
             if e.get("MaxJumpRange"):
                 self.state["max_jump_range"] = e["MaxJumpRange"]
+            if e.get("CargoCapacity") is not None:
+                self.state["cargo_capacity"] = e["CargoCapacity"]
             modules = e.get("Modules")
             if modules is not None:
                 self.state["equipped_modules"] = {
@@ -810,6 +870,19 @@ class JournalWatcher:
                 self.state["stored_modules"] = {
                     i["Name"] for i in items if i.get("Name")
                 }
+        elif et == "StoredShips":
+            # Fires when the Ships tab is opened at a shipyard — not automatic
+            # every session, so this can stay empty for a while. Ships whose
+            # ShipType isn't in SHIP_SLUGS are skipped rather than guessed at,
+            # since there's no real coriolis-data slot info to size them with.
+            entries = (e.get("ShipsHere") or []) + (e.get("ShipsRemote") or [])
+            ships = []
+            for entry in entries:
+                ship_type = (entry.get("ShipType") or "").lower()
+                if ship_type not in SHIP_SLUGS:
+                    continue
+                ships.append({"ship_internal": ship_type, "system": entry.get("StarSystem")})
+            self.state["owned_ships"] = ships
         elif et == "Rank":
             for k in RANK_KEYS:
                 if k in e:
@@ -1338,12 +1411,13 @@ class GuidePanel:
 
     RISK_COLOR = {"Low": GOOD, "Medium": WARN, "High": BAD}
 
-    def __init__(self, parent, path, on_toggle, wrap=380):
+    def __init__(self, parent, path, on_toggle, wrap=380, on_go=None):
         self.key = path["key"]
         self.path = path
         self.expanded = False
         self.built = False
         self.wrap = wrap
+        self._personal_nav_system = None
 
         self.frame = tk.Frame(parent, bg=PANEL_BG, bd=0, highlightthickness=1,
                                highlightbackground="#2a2a2a")
@@ -1384,6 +1458,32 @@ class GuidePanel:
                               wraplength=wrap, cursor="hand2")
         self.body.pack(fill="x", padx=8, pady=(0, 8))
 
+        # "For My Ships" personalization — hidden by default, shown/hidden as
+        # a block by the Guide tab's sub-tab switch (not per-card state).
+        self.personal_frame = tk.Frame(self.frame, bg=PANEL_BG)
+        self.personal_ship_var = tk.StringVar(value="")
+        self.personal_ship_label = tk.Label(
+            self.personal_frame, textvariable=self.personal_ship_var, font=FONT_SMALL,
+            bg=PANEL_BG, fg=FG, anchor="w", justify="left", wraplength=wrap)
+        self.personal_ship_label.pack(fill="x", padx=8, pady=(0, 2))
+
+        nav_row = tk.Frame(self.personal_frame, bg=PANEL_BG)
+        nav_row.pack(fill="x", padx=8, pady=(0, 8))
+        self.personal_nav_var = tk.StringVar(value="")
+        # Reserve room for the Go button sharing this row (wrap-30 is what
+        # title_label uses, but that row has no same-width sibling widget —
+        # leaving the Go button unaccounted for here pushed it past the
+        # card's right edge).
+        self.personal_nav_label = tk.Label(
+            nav_row, textvariable=self.personal_nav_var, font=FONT_SMALL, bg=PANEL_BG,
+            fg=MUTED, anchor="w", justify="left", wraplength=max(80, wrap - 60))
+        self.personal_nav_label.pack(side="left", fill="x", expand=True)
+        self.personal_go_btn = tk.Label(nav_row, text="Go", font=FONT_SMALL_BOLD, bg=PANEL_BG,
+                                         fg=MUTED, padx=4)
+        self.personal_go_btn.pack(side="right", anchor="n")
+        if on_go:
+            self.personal_go_btn.bind("<Button-1>", lambda e: on_go(self.key, self._personal_nav_system))
+
         self.detail_frame = tk.Frame(self.frame, bg=PANEL_BG)
 
         for w in (header, title_row, self.arrow, self.title_label, badge_row, self.body,
@@ -1413,6 +1513,8 @@ class GuidePanel:
         self.wrap = wrap
         self.body.config(wraplength=wrap)
         self.title_label.config(wraplength=max(90, wrap - 30))
+        self.personal_ship_label.config(wraplength=wrap)
+        self.personal_nav_label.config(wraplength=max(80, wrap - 60))
         if self.built:
             inner_wrap = max(120, wrap - 10)
             children = self.detail_frame.winfo_children()
@@ -1450,6 +1552,30 @@ class GuidePanel:
             tk.Label(self.detail_frame, text=f"• {tip}", font=FONT_SMALL,
                      bg=PANEL_BG, fg=MUTED, anchor="w", justify="left",
                      wraplength=inner_wrap).pack(fill="x", padx=(8, 0), pady=1)
+
+    def set_personal_mode(self, is_personal):
+        if is_personal:
+            if not self.personal_frame.winfo_manager():
+                # detail_frame is only packed once the card's been expanded
+                # at least once — anchor before it when possible, but a plain
+                # pack() still lands in the right spot (append order) since
+                # this always runs before an unexpanded card's detail_frame
+                # gets packed for the first time.
+                kwargs = {"fill": "x"}
+                if self.detail_frame.winfo_manager():
+                    kwargs["before"] = self.detail_frame
+                self.personal_frame.pack(**kwargs)
+        elif self.personal_frame.winfo_manager():
+            self.personal_frame.pack_forget()
+
+    def update_personalization(self, ship_line, nav_line, nav_system):
+        self.personal_ship_var.set(ship_line or "")
+        self.personal_nav_var.set(nav_line or "")
+        self._personal_nav_system = nav_system
+        if nav_system:
+            self.personal_go_btn.config(fg=ACCENT, cursor="hand2")
+        else:
+            self.personal_go_btn.config(fg=MUTED, cursor="")
 
     def flash_highlight(self):
         self.frame.config(highlightbackground=ACCENT, highlightthickness=2)
@@ -1507,6 +1633,19 @@ class App:
         self.material_finder = MaterialSearchFinder()
         self._material_last_status = None
         self.material_mode = "surface"
+        # Separate instances (not shared with the Explore tab's finders above)
+        # so the Guide tab's fixed auto-query (current system, Painite) can't
+        # clobber whatever the user manually searched for in Explore, or vice
+        # versa — both wrap the same finder classes.
+        self.guide_unexplored_finder = UnexploredFinder()
+        self.guide_material_finder = MaterialSearchFinder()
+        self._guide_unexplored_origin = None
+        self._guide_material_origin = None
+        self.guide_subtab = "general"
+        self._owned_ships_signature = None
+        self._ship_recommendations = {}
+        self._personal_recs_ready = False
+        self._personal_ship_count = 0
         self.update_checker = UpdateChecker()
         self._update_last_status = None
 
@@ -1721,6 +1860,24 @@ class App:
         tk.Label(hint, text="Click a path to see early steps and tips", font=FONT_SMALL,
                  bg=BG, fg=MUTED).pack(side="left")
 
+        subtab_row = tk.Frame(frame, bg=BG)
+        subtab_row.pack(fill="x", padx=10, pady=(4, 0))
+        self.guide_subtab_buttons = {}
+        for key, label in (("general", "General"), ("personal", "For My Ships")):
+            active = key == self.guide_subtab
+            btn = tk.Label(subtab_row, text=label, font=FONT_SMALL_BOLD, cursor="hand2",
+                            padx=8, pady=3, bg=BG if active else CARD_BG,
+                            fg=ACCENT if active else MUTED)
+            btn.pack(side="left", padx=(0, 4))
+            btn.bind("<Button-1>", lambda e, k=key: self._set_guide_subtab(k))
+            self.guide_subtab_buttons[key] = btn
+
+        self.guide_personal_status_var = tk.StringVar(value="")
+        self.guide_personal_status_label = tk.Label(
+            frame, textvariable=self.guide_personal_status_var, font=FONT_SMALL, bg=BG,
+            fg=MUTED, anchor="w", justify="left", wraplength=460)
+        # Not packed yet — shown only while the "For My Ships" sub-tab is active.
+
         self.recommend_var = tk.StringVar(value="")
         self.recommend_banner = tk.Label(frame, textvariable=self.recommend_var, font=FONT_SMALL,
                                           bg=PANEL_BG, fg=ACCENT, anchor="w", justify="left",
@@ -1762,7 +1919,8 @@ class App:
         self.guide_cols_row = tk.Frame(inner, bg=BG)
         self.guide_cols_row.pack(fill="both", expand=True)
         for path in PATHS:
-            panel = GuidePanel(self.guide_cols_row, path, self._toggle_guide_panel, wrap=GUIDE_MIN_CARD_W)
+            panel = GuidePanel(self.guide_cols_row, path, self._toggle_guide_panel,
+                                wrap=GUIDE_MIN_CARD_W, on_go=self._on_rank_go)
             self.guide_panels[path["key"]] = panel
 
         self.tab_frames["guide"] = frame
@@ -1800,6 +1958,176 @@ class App:
                 panel.grid_at(idx // n, idx % n, sticky="nsew", padx=6, pady=5)
             else:
                 panel.hide()
+
+    def _set_guide_subtab(self, key):
+        if key == self.guide_subtab:
+            return
+        self.guide_subtab = key
+        for k, btn in self.guide_subtab_buttons.items():
+            active = k == key
+            btn.config(fg=ACCENT if active else MUTED, bg=BG if active else CARD_BG)
+        for panel in self.guide_panels.values():
+            panel.set_personal_mode(key == "personal")
+        if key == "personal":
+            if not self.guide_personal_status_label.winfo_manager():
+                self.guide_personal_status_label.pack(fill="x", padx=10, pady=(2, 0),
+                                                        before=self.guide_filter_box)
+        elif self.guide_personal_status_label.winfo_manager():
+            self.guide_personal_status_label.pack_forget()
+
+    def _guide_ship_signature(self, state):
+        owned = state.get("owned_ships", [])
+        current_internal = state.get("ship_internal")
+        slugs = {SHIP_SLUGS[o["ship_internal"]] for o in owned if o["ship_internal"] in SHIP_SLUGS}
+        if current_internal in SHIP_SLUGS:
+            slugs.add(SHIP_SLUGS[current_internal])
+        return frozenset(slugs)
+
+    def _poll_personalization(self):
+        """Lazy: only fetches/queries anything while the "For My Ships"
+        sub-tab is actually open, mirroring the Build tab's on-demand load."""
+        if self.guide_subtab != "personal":
+            return
+        state, _ = self.watcher.get_snapshot()
+
+        signature = self._guide_ship_signature(state)
+        if signature != self._owned_ships_signature:
+            self._owned_ships_signature = signature
+            self._ship_recommendations = {}
+            self._personal_recs_ready = False
+
+        missing = [s for s in signature if self.ship_store.get_ship(s) is None]
+        if missing:
+            status, _error, _loaded = self.ship_store.get_snapshot()
+            if status != "loading":
+                self.ship_store.ensure_loaded(missing[0])
+        elif not self._personal_recs_ready:
+            self._compute_ship_recommendations(state)
+            self._personal_recs_ready = True
+
+        current_system = state.get("system")
+        if current_system and current_system != self._guide_unexplored_origin:
+            self._guide_unexplored_origin = current_system
+            self.guide_unexplored_finder.find(current_system, min(EDSM_RADIUS_LY, EDSM_MAX_RADIUS_LY))
+        if current_system and current_system != self._guide_material_origin:
+            self._guide_material_origin = current_system
+            self.guide_material_finder.search(current_system, "ring", MINING_NAV_COMMODITY,
+                                               MATERIAL_SEARCH_RADIUS_LY)
+
+        self._render_guide_personal(state, missing)
+        self._render_guide_personal_status(state, missing)
+
+    def _compute_ship_recommendations(self, state):
+        owned = state.get("owned_ships", [])
+        current_internal = state.get("ship_internal")
+        entries = {}
+        for o in owned:
+            slug = SHIP_SLUGS.get(o["ship_internal"])
+            if slug:
+                entries[o["ship_internal"]] = slug
+        current_slug = SHIP_SLUGS.get(current_internal)
+        if current_slug:
+            entries[current_internal] = current_slug
+        self._personal_ship_count = len(entries)
+
+        recs = {}
+        for path_key, category in PATH_STAT_CATEGORY.items():
+            best = None
+            for internal, slug in entries.items():
+                wrapper = self.ship_store.get_ship(slug)
+                ship = wrapper.get(slug) if wrapper else None
+                if not ship:
+                    continue
+                score = ship_stat_score(ship, category)
+                if best is None or score > best[0]:
+                    best = (score, internal)
+            recs[path_key] = best
+        self._ship_recommendations = recs
+
+    def _personal_ship_line(self, path_key, category, current_internal, loading,
+                             cargo_capacity, max_jump_range, fitted_hardpoints):
+        if category is None:
+            return "Ship-agnostic — whichever owned ship fits the objective works."
+        if loading:
+            return "Loading your owned ships' component data..."
+        rec = self._ship_recommendations.get(path_key)
+        if not rec:
+            return ("No owned-ship data yet — visit any shipyard's Ships tab in-game, or fly your "
+                     "current ship, so this can compare your fleet.")
+        score, internal = rec
+        name = SHIP_NAMES.get(internal, internal)
+        label = STAT_CATEGORY_LABEL.get(category, "capacity")
+        if internal == current_internal:
+            if category == "cargo" and cargo_capacity is not None:
+                return f"Your current ship, the {name}, is your best owned pick — {cargo_capacity:.0f}t cargo fitted."
+            if category == "fsd" and max_jump_range is not None:
+                return f"Your current ship, the {name}, is your best owned pick — {max_jump_range:.1f} ly jump range fitted."
+            if category == "hardpoint" and fitted_hardpoints:
+                return f"Your current ship, the {name}, is your best owned pick — {fitted_hardpoints} hardpoint(s) fitted."
+            return f"Your current ship, the {name}, is your best owned pick (hull {label}: {score})."
+        return f"Best owned ship for this: {name} (hull {label}: {score} — unfitted hull capacity, not a live loadout)."
+
+    def _personal_nav_line(self, nav_mode, current_system, nearest_unexplored,
+                            nearest_material, nearest_hub):
+        if nav_mode is None:
+            return "No single destination applies for this — see the tips above.", None
+        if not current_system:
+            return "Current system unknown yet — play a session or load sample data.", None
+        if nav_mode == "unexplored":
+            if nearest_unexplored is None:
+                return (f"Looking for an unexplored system near {current_system} "
+                         f"(see the Explore tab for full control)...", None)
+            return (f"Nearest unexplored: {nearest_unexplored['name']} "
+                     f"({nearest_unexplored['distance']:.1f} ly)", nearest_unexplored["name"])
+        if nav_mode == "material":
+            if nearest_material is None:
+                return (f"Looking for a {MINING_NAV_COMMODITY} hotspot near {current_system} "
+                         f"(see the Explore tab for other commodities)...", None)
+            return (f"Nearest {MINING_NAV_COMMODITY} hotspot: {nearest_material['system']} "
+                     f"({nearest_material['distance']:.1f} ly)", nearest_material["system"])
+        if nav_mode == "hub":
+            if nearest_hub is None:
+                return f"Finding a nearby populated system near {current_system}...", None
+            return (f"Nearest hub: {nearest_hub['name']} ({nearest_hub['distance']:.1f} ly) — "
+                     f"check its board", nearest_hub["name"])
+        return "", None
+
+    def _render_guide_personal(self, state, missing_slugs):
+        current_internal = state.get("ship_internal")
+        current_system = state.get("system")
+        cargo_capacity = state.get("cargo_capacity")
+        max_jump_range = state.get("max_jump_range")
+        equipped = state.get("equipped_modules", {})
+        fitted_hardpoints = sum(1 for slot in equipped if "hardpoint" in slot.lower())
+
+        _status, _error, unexplored_results = self.guide_unexplored_finder.get_snapshot()
+        nearest_unexplored = min(unexplored_results, key=lambda r: r["distance"]) if unexplored_results else None
+        _status, _error, material_results = self.guide_material_finder.get_snapshot()
+        nearest_material = min(material_results, key=lambda r: r["distance"]) if material_results else None
+        _status, _error, nearby_origin, nearby_results = self.nearby_finder.get_snapshot()
+        nearest_hub = nearest_populated_system(nearby_results) if nearby_origin == current_system else None
+
+        loading = bool(missing_slugs)
+        for path in PATHS:
+            panel = self.guide_panels[path["key"]]
+            category = PATH_STAT_CATEGORY.get(path["key"])
+            ship_line = self._personal_ship_line(path["key"], category, current_internal, loading,
+                                                  cargo_capacity, max_jump_range, fitted_hardpoints)
+            nav_mode = PATH_NAV_MODE.get(path["key"])
+            nav_line, nav_system = self._personal_nav_line(nav_mode, current_system, nearest_unexplored,
+                                                             nearest_material, nearest_hub)
+            panel.update_personalization(ship_line, nav_line, nav_system)
+
+    def _render_guide_personal_status(self, state, missing_slugs):
+        if missing_slugs:
+            text = f"Loading component data for {len(missing_slugs)} owned ship(s)..."
+        elif not state.get("owned_ships"):
+            text = ("No stored-ship data received yet — visit any shipyard's Ships tab in-game (or "
+                     "click Load Sample Data) to personalize this against your whole fleet. Showing "
+                     "your current ship only for now.")
+        else:
+            text = f"Personalized against {self._personal_ship_count} owned ship(s)."
+        self.guide_personal_status_var.set(text)
 
     # ---------- Tracker tab ----------
 
@@ -2680,6 +3008,7 @@ class App:
 
         self._render_recommendation(state)
         self._render_nav_suggestion(state)
+        self._poll_personalization()
 
         if self.build_slug:
             ship_status, ship_error, ship_loaded_slug = self.ship_store.get_snapshot()
