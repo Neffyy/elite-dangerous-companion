@@ -30,7 +30,7 @@ TICK_INTERVAL_MS = 1000
 # Bump both of these together whenever a real change is pushed to the repo —
 # the app compares its own APP_VERSION against the VERSION file living at
 # the repo root to know when a newer copy is available.
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 APP_REPO = "Neffyy/elite-dangerous-companion"
 APP_REPO_URL = f"https://github.com/{APP_REPO}"
 APP_VERSION_URL = f"https://raw.githubusercontent.com/{APP_REPO}/main/VERSION"
@@ -166,6 +166,7 @@ SHIP_SLUGS = {
     "belugaliner": "beluga", "ferdelance": "fer_de_lance",
     "anaconda": "anaconda", "cutter": "imperial_cutter", "mamba": "mamba",
     "krait_mkii": "krait_mkii", "krait_light": "krait_phantom",
+    "mandalay": "mandalay",
 }
 
 # Standard (core) slots are always these 7 categories in this fixed order.
@@ -270,6 +271,7 @@ SHIP_NAMES = {
     "belugaliner": "Beluga Liner", "ferdelance": "Fer-de-Lance",
     "anaconda": "Anaconda", "cutter": "Imperial Cutter", "mamba": "Mamba",
     "krait_mkii": "Krait Mk II", "krait_light": "Krait Phantom",
+    "mandalay": "Mandalay",
 }
 
 PATHS = [
