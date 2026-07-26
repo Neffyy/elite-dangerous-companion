@@ -30,7 +30,7 @@ TICK_INTERVAL_MS = 1000
 # Bump both of these together whenever a real change is pushed to the repo —
 # the app compares its own APP_VERSION against the VERSION file living at
 # the repo root to know when a newer copy is available.
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 APP_REPO = "Neffyy/elite-dangerous-companion"
 APP_REPO_URL = f"https://github.com/{APP_REPO}"
 APP_VERSION_URL = f"https://raw.githubusercontent.com/{APP_REPO}/main/VERSION"
@@ -99,6 +99,10 @@ ROUTE_POLL_TIMEOUT_SEC = 90
 # via EDSM's free public API — no key required.
 EDSM_SPHERE_URL = "https://www.edsm.net/api-v1/sphere-systems"
 EDSM_RADIUS_LY = 50
+# EDSM's sphere-systems endpoint hard-caps radius at 100 ly — above that it
+# silently returns an empty/non-list response (or even times out near dense
+# areas) instead of a real error, so this needs to be enforced client-side.
+EDSM_MAX_RADIUS_LY = 100
 # Combat/Trade/Explore/CQC don't have a single "correct" faction to work
 # for, so their suggestion is just the nearest populated system. Federation
 # and Empire rank-ups specifically require missions from factions aligned
@@ -1483,7 +1487,6 @@ class App:
 
         root.title("Elite Dangerous Companion")
         root.configure(bg=BG)
-        root.attributes("-topmost", True)
         saved_geometry = clean_geometry(self.settings.get("window_geometry"))
         root.geometry(saved_geometry if saved_geometry and geometry_on_screen(saved_geometry)
                       else DEFAULT_GEOMETRY)
@@ -2407,7 +2410,8 @@ class App:
         find_btn.bind("<Button-1>", self._find_unexplored)
 
         self.unexplored_status_var = tk.StringVar(
-            value="Checks nearby systems against EDSM — real, but slow (one request per candidate).")
+            value=f"Checks nearby systems against EDSM — real, but slow (one request per candidate). "
+                  f"Max radius {EDSM_MAX_RADIUS_LY} ly (EDSM's own limit).")
         tk.Label(unexplored_box, textvariable=self.unexplored_status_var, font=FONT_SMALL, bg=BG,
                  fg=MUTED, anchor="w", justify="left", wraplength=440).pack(fill="x", padx=8, pady=(0, 4))
 
@@ -2514,6 +2518,11 @@ class App:
                 raise ValueError
         except ValueError:
             self.unexplored_status_var.set("Radius must be a positive number of light years.")
+            return
+        if radius > EDSM_MAX_RADIUS_LY:
+            self.unexplored_status_var.set(
+                f"Radius must be {EDSM_MAX_RADIUS_LY} ly or less — EDSM's system lookup doesn't "
+                f"support larger searches.")
             return
         self.unexplored_status_var.set(f"Checking systems near {origin} (this can take a moment)...")
         for w in self.unexplored_results_frame.winfo_children():
