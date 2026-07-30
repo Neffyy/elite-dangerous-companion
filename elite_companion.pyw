@@ -30,7 +30,7 @@ TICK_INTERVAL_MS = 1000
 # Bump both of these together whenever a real change is pushed to the repo —
 # the app compares its own APP_VERSION against the VERSION file living at
 # the repo root to know when a newer copy is available.
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 APP_REPO = "Neffyy/elite-dangerous-companion"
 APP_REPO_URL = f"https://github.com/{APP_REPO}"
 APP_VERSION_URL = f"https://raw.githubusercontent.com/{APP_REPO}/main/VERSION"
@@ -41,6 +41,14 @@ DEFAULT_GEOMETRY = "600x800+40+40"
 DEFAULT_VIEW_MODES = {"guide": "auto", "tracker": "auto", "nav": "auto", "build": "auto", "explore": "auto",
                        "colony": "auto"}
 GEOMETRY_RE = re.compile(r"^(\d+)x(\d+)([+-]\d+)([+-]\d+)$")
+
+# In-game overlay: a color-keyed transparent Toplevel (Tk's real, standard
+# Windows transparency mechanism — no memory reading, no DirectX hooking,
+# same category of technique legitimate tools like EDMC's overlay plugins
+# use), click-through by default via the Win32 WS_EX_TRANSPARENT extended
+# style so it never blocks input to the game underneath.
+OVERLAY_TRANSPARENT_KEY = "#010203"
+DEFAULT_OVERLAY_POS = "+40+40"
 
 
 def load_settings():
@@ -1888,6 +1896,28 @@ def apply_dark_titlebar(root):
         pass
 
 
+def set_overlay_click_through(toplevel, enabled):
+    """Toggle WS_EX_TRANSPARENT on a Toplevel's real HWND — clicks pass
+    straight through to whatever's underneath when enabled. Tk's own
+    -transparentcolor attribute already sets WS_EX_LAYERED (required for
+    this to work at all), so this only needs to OR/AND the TRANSPARENT bit
+    on top of whatever style Tk already applied, not replace it wholesale."""
+    GWL_EXSTYLE = -20
+    WS_EX_LAYERED = 0x00080000
+    WS_EX_TRANSPARENT = 0x00000020
+    try:
+        toplevel.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(toplevel.winfo_id())
+        style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        if enabled:
+            style |= (WS_EX_LAYERED | WS_EX_TRANSPARENT)
+        else:
+            style = (style | WS_EX_LAYERED) & ~WS_EX_TRANSPARENT
+        ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+    except (OSError, AttributeError):
+        pass
+
+
 def ensure_single_instance():
     ERROR_ALREADY_EXISTS = 183
     ctypes.windll.kernel32.CreateMutexW(None, False, "EliteCompanionSingleInstance")
@@ -1941,6 +1971,13 @@ class App:
         self.update_checker = UpdateChecker()
         self._update_last_status = None
 
+        self.overlay_win = None
+        self.overlay_visible = bool(self.settings.get("overlay_visible", False))
+        self.overlay_locked = True
+        saved_overlay_pos = self.settings.get("overlay_pos")
+        self.overlay_pos = saved_overlay_pos if isinstance(saved_overlay_pos, str) else DEFAULT_OVERLAY_POS
+        self._overlay_drag_origin = None
+
         self.tab_frames = {}
         self.tab_buttons = {}
         self.tab_canvases = {}
@@ -1973,7 +2010,8 @@ class App:
             geometry = clean_geometry(self.root.geometry())
         except tk.TclError:
             geometry = None
-        settings = {"view_modes": self.view_modes}
+        settings = {"view_modes": self.view_modes, "overlay_visible": self.overlay_visible,
+                    "overlay_pos": self.overlay_pos}
         if geometry and GEOMETRY_RE.match(geometry):
             settings["window_geometry"] = geometry
         save_settings(settings)
@@ -1996,6 +2034,18 @@ class App:
             btn.pack(side="left")
             btn.bind("<Button-1>", lambda e, m=mode: self._set_view_mode(m))
             self.view_buttons[mode] = btn
+
+        overlay_box = tk.Frame(top, bg=PANEL_BG, highlightthickness=1,
+                                highlightbackground="#2a2a2a")
+        overlay_box.pack(side="right", padx=(0, 6))
+        self.overlay_show_btn = tk.Label(overlay_box, text="⧉ Overlay", font=FONT_SMALL_BOLD,
+                                          bg=PANEL_BG, fg=MUTED, cursor="hand2", padx=8, pady=3)
+        self.overlay_show_btn.pack(side="left")
+        self.overlay_show_btn.bind("<Button-1>", lambda e: self._toggle_overlay_visible())
+        self.overlay_lock_btn = tk.Label(overlay_box, text="🔒", font=FONT_SMALL_BOLD, bg=PANEL_BG,
+                                          fg=MUTED, cursor="hand2", padx=8, pady=3)
+        self.overlay_lock_btn.pack(side="left")
+        self.overlay_lock_btn.bind("<Button-1>", lambda e: self._toggle_overlay_lock())
 
         self._build_tab_bar()
 
@@ -2034,6 +2084,9 @@ class App:
         self.root.geometry(f"{w}x{h}")
 
         self.update_checker.check()
+        self._build_overlay()
+        if self.overlay_visible:
+            self._show_overlay()
 
     def _on_update_banner_click(self, event=None):
         try:
@@ -3473,6 +3526,122 @@ class App:
                          bg=PANEL_BG, fg=GOOD, anchor="w").pack(fill="x", padx=8, pady=(2, 6))
             tk.Frame(card, bg=PANEL_BG, height=6).pack()
 
+    # ---------- In-game overlay ----------
+
+    def _build_overlay(self):
+        win = tk.Toplevel(self.root)
+        # A distinct title, even though overrideredirect() hides its
+        # titlebar — Tk Toplevels otherwise inherit the root window's WM_NAME,
+        # which makes the two windows indistinguishable to anything (incl.
+        # Windows UI Automation) that looks them up by name.
+        win.title("Elite Dangerous Companion Overlay")
+        win.withdraw()
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg=OVERLAY_TRANSPARENT_KEY)
+        try:
+            win.attributes("-transparentcolor", OVERLAY_TRANSPARENT_KEY)
+        except tk.TclError:
+            pass  # non-Windows Tk builds don't support color-key transparency
+        win.geometry(self.overlay_pos)
+        self.overlay_win = win
+
+        content = tk.Frame(win, bg=PANEL_BG, highlightthickness=1, highlightbackground=ACCENT)
+        content.pack()
+
+        header = tk.Frame(content, bg=PANEL_BG)
+        header.pack(fill="x", padx=8, pady=(6, 2))
+        tk.Label(header, text="ELITE COMPANION", font=FONT_SMALL_BOLD, bg=PANEL_BG,
+                 fg=ACCENT).pack(side="left")
+        self.overlay_lock_hint_var = tk.StringVar(value="")
+        tk.Label(header, textvariable=self.overlay_lock_hint_var, font=FONT_SMALL, bg=PANEL_BG,
+                 fg=MUTED).pack(side="right")
+
+        self.overlay_status_var = tk.StringVar(value="--")
+        self.overlay_location_var = tk.StringVar(value="--")
+        self.overlay_suggestion_var = tk.StringVar(value="")
+        self.overlay_route_var = tk.StringVar(value="")
+        for var, color in ((self.overlay_status_var, FG), (self.overlay_location_var, MUTED),
+                            (self.overlay_suggestion_var, ACCENT), (self.overlay_route_var, MUTED)):
+            tk.Label(content, textvariable=var, font=FONT_SMALL, bg=PANEL_BG, fg=color,
+                     anchor="w", justify="left", wraplength=260).pack(fill="x", padx=8, pady=(0, 2))
+        tk.Frame(content, bg=PANEL_BG, height=6).pack()
+
+        # Drag-to-reposition only does anything while unlocked (interactive)
+        # — bind recursively on every descendant, not just direct children,
+        # since Tk doesn't bubble <Button-1> up to a parent's binding when a
+        # click lands on a child widget (e.g. the "ELITE COMPANION" label
+        # itself, not just the header frame's empty space around it).
+        def _bind_drag_recursive(widget):
+            widget.bind("<Button-1>", self._overlay_drag_start)
+            widget.bind("<B1-Motion>", self._overlay_drag_motion)
+            for child in widget.winfo_children():
+                _bind_drag_recursive(child)
+        _bind_drag_recursive(content)
+
+        set_overlay_click_through(win, True)
+
+    def _show_overlay(self):
+        self.overlay_visible = True
+        self.overlay_win.deiconify()
+        self.overlay_show_btn.config(fg=ACCENT, bg=CARD_BG)
+
+    def _hide_overlay(self):
+        self.overlay_visible = False
+        self.overlay_win.withdraw()
+        self.overlay_show_btn.config(fg=MUTED, bg=PANEL_BG)
+
+    def _toggle_overlay_visible(self):
+        if self.overlay_visible:
+            self._hide_overlay()
+        else:
+            self._show_overlay()
+
+    def _toggle_overlay_lock(self):
+        self.overlay_locked = not self.overlay_locked
+        set_overlay_click_through(self.overlay_win, self.overlay_locked)
+        if self.overlay_locked:
+            self.overlay_lock_btn.config(text="🔒", fg=MUTED)
+            self.overlay_lock_hint_var.set("")
+        else:
+            self.overlay_lock_btn.config(text="🔓", fg=ACCENT)
+            self.overlay_lock_hint_var.set("drag to move")
+
+    def _overlay_drag_start(self, event):
+        if self.overlay_locked:
+            return
+        self._overlay_drag_origin = (event.x_root, event.y_root,
+                                      self.overlay_win.winfo_x(), self.overlay_win.winfo_y())
+
+    def _overlay_drag_motion(self, event):
+        if self.overlay_locked or not self._overlay_drag_origin:
+            return
+        start_x, start_y, win_x, win_y = self._overlay_drag_origin
+        new_x = win_x + (event.x_root - start_x)
+        new_y = win_y + (event.y_root - start_y)
+        self.overlay_win.geometry(f"+{new_x}+{new_y}")
+        self.overlay_pos = f"+{new_x}+{new_y}"
+
+    def _render_overlay(self, state):
+        if not self.overlay_visible or self.overlay_win is None:
+            return
+        self.overlay_status_var.set(fmt_credits(state.get("credits")))
+        loc_bits = [b for b in (state.get("system"), state.get("station")) if b]
+        self.overlay_location_var.set(" — ".join(loc_bits) if loc_bits else "Location unknown")
+        self.overlay_suggestion_var.set(self.nav_suggestion_var.get() or "")
+
+        route_status, _route_error, route_result = self.route_plotter.get_snapshot()
+        if route_status == "done" and route_result:
+            jumps = route_result.get("system_jumps", [])
+            if len(jumps) > 1:
+                nxt = jumps[1]
+                self.overlay_route_var.set(
+                    f"Next: {nxt.get('system', '?')} ({nxt.get('jumps', 0)} jump(s))")
+            else:
+                self.overlay_route_var.set("")
+        else:
+            self.overlay_route_var.set("")
+
     # ---------- Tick ----------
 
     def _tick(self):
@@ -3568,6 +3737,8 @@ class App:
         if update_status != self._update_last_status:
             self._update_last_status = update_status
             self._render_update_banner(update_status, latest_version)
+
+        self._render_overlay(state)
 
         self.root.after(TICK_INTERVAL_MS, self._tick)
 
