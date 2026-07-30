@@ -30,7 +30,7 @@ TICK_INTERVAL_MS = 1000
 # Bump both of these together whenever a real change is pushed to the repo —
 # the app compares its own APP_VERSION against the VERSION file living at
 # the repo root to know when a newer copy is available.
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 APP_REPO = "Neffyy/elite-dangerous-companion"
 APP_REPO_URL = f"https://github.com/{APP_REPO}"
 APP_VERSION_URL = f"https://raw.githubusercontent.com/{APP_REPO}/main/VERSION"
@@ -38,7 +38,8 @@ APP_VERSION_URL = f"https://raw.githubusercontent.com/{APP_REPO}/main/VERSION"
 SETTINGS_PATH = (Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
                   / "EliteDangerousCompanion" / "settings.json")
 DEFAULT_GEOMETRY = "600x800+40+40"
-DEFAULT_VIEW_MODES = {"guide": "auto", "tracker": "auto", "nav": "auto", "build": "auto", "explore": "auto"}
+DEFAULT_VIEW_MODES = {"guide": "auto", "tracker": "auto", "nav": "auto", "build": "auto", "explore": "auto",
+                       "colony": "auto"}
 GEOMETRY_RE = re.compile(r"^(\d+)x(\d+)([+-]\d+)([+-]\d+)$")
 
 
@@ -658,6 +659,13 @@ SAMPLE_EVENTS = [
      "Explore": 63, "CQC": 0, "Federation": 5, "Empire": 0},
     {"timestamp": "2026-07-24T10:00:03Z", "event": "Location", "StarSystem": "Shinrarta Dezhra",
      "Docked": True, "StationName": "Jameson Memorial"},
+    {"timestamp": "2026-07-24T10:00:03Z", "event": "ColonisationConstructionDepot",
+     "MarketID": 3901234567, "ConstructionProgress": 0.42, "ConstructionComplete": False,
+     "ConstructionFailed": False, "ResourcesRequired": [
+         {"Name": "steel", "Name_Localised": "Steel", "RequiredAmount": 5000, "ProvidedAmount": 2200},
+         {"Name": "cmmcomposite", "Name_Localised": "CMM Composite", "RequiredAmount": 1200, "ProvidedAmount": 1200},
+         {"Name": "waterpurifiers", "Name_Localised": "Water Purifiers", "RequiredAmount": 800, "ProvidedAmount": 150},
+     ]},
     {"timestamp": "2026-07-24T10:00:04Z", "event": "Loadout", "Ship": "cobramkiii",
      "MaxJumpRange": 20.7, "CargoCapacity": 22, "Modules": [
          {"Slot": "PowerPlant", "Item": "int_powerplant_size4_class3", "On": True, "Priority": 1, "Health": 1.0},
@@ -762,6 +770,8 @@ def new_state():
         "cargo_capacity": None,   # current ship only, from Loadout
         "owned_ships": [],        # [{"ship_internal": str, "system": str|None}, ...] from StoredShips
         "powerplay": None,        # {"power","rank","merits","votes","time_pledged"} or None if unpledged
+        "colonization_depots": {},  # market_id -> {"system","station","progress","complete",
+                                     #               "failed","resources":[{"name","required","provided"}]}
     }
 
 
@@ -910,6 +920,26 @@ class JournalWatcher:
             }
         elif et == "PowerplayLeave":
             self.state["powerplay"] = None
+        elif et == "ColonisationConstructionDepot":
+            # No StarSystem/StationName on this event itself (confirmed
+            # against real EDMC construction-tracker plugin source) — snapshot
+            # whatever system/station we're currently docked at, same as how
+            # every other station-service event in this app already works.
+            market_id = e.get("MarketID")
+            if market_id is not None:
+                resources = [
+                    {"name": r.get("Name_Localised") or r.get("Name", "?"),
+                     "required": r.get("RequiredAmount", 0), "provided": r.get("ProvidedAmount", 0)}
+                    for r in e.get("ResourcesRequired") or []
+                ]
+                self.state["colonization_depots"][market_id] = {
+                    "system": self.state.get("system"),
+                    "station": self.state.get("station"),
+                    "progress": e.get("ConstructionProgress", 0.0),
+                    "complete": e.get("ConstructionComplete", False),
+                    "failed": e.get("ConstructionFailed", False),
+                    "resources": resources,
+                }
         elif et == "Rank":
             for k in RANK_KEYS:
                 if k in e:
@@ -1815,6 +1845,7 @@ class App:
         self._build_nav_tab(tab_container)
         self._build_build_tab(tab_container)
         self._build_explore_tab(tab_container)
+        self._build_colonization_tab(tab_container)
 
         self.root.bind_all("<MouseWheel>", self._on_mousewheel)
         self._switch_tab("guide")
@@ -1855,7 +1886,7 @@ class App:
         bar = tk.Frame(self.root, bg=BG)
         bar.pack(fill="x", padx=10, pady=(6, 0))
         for key, label in (("guide", "Guide"), ("tracker", "Tracker"), ("nav", "Nav"), ("build", "Build"),
-                           ("explore", "Explore")):
+                           ("explore", "Explore"), ("colony", "Colony")):
             btn = tk.Label(bar, text=label, font=FONT_TITLE, bg=BG, fg=MUTED,
                             cursor="hand2", padx=10, pady=4)
             btn.pack(side="left")
@@ -3081,6 +3112,98 @@ class App:
             go_btn.pack(side="right")
             go_btn.bind("<Button-1>", lambda e, n=r["system"]: self._on_explore_go(n))
 
+    # ---------- Colonization tab ----------
+
+    def _build_colonization_tab(self, parent):
+        frame = tk.Frame(parent, bg=BG)
+        outer, canvas, inner = self._make_scrollable(frame)
+        outer.pack(fill="both", expand=True)
+
+        tk.Label(inner, text="Tracks your own active construction site(s) — this only shows real "
+                              "sites you've actually docked at (via the Journal's construction-depot "
+                              "event); there's no public data source for discovering colonization "
+                              "opportunities elsewhere in the galaxy.",
+                 font=FONT_SMALL, bg=BG, fg=MUTED, anchor="w", justify="left",
+                 wraplength=460).pack(fill="x", padx=10, pady=(6, 4))
+
+        self.colony_status_var = tk.StringVar(
+            value="No active construction site tracked yet — dock at one to populate this.")
+        self.colony_status_label = tk.Label(inner, textvariable=self.colony_status_var, font=FONT_SMALL,
+                                             bg=BG, fg=MUTED, anchor="w", justify="left", wraplength=460)
+        self.colony_status_label.pack(fill="x", padx=10, pady=(0, 4))
+
+        self.colony_cards_frame = tk.Frame(inner, bg=BG)
+        self.colony_cards_frame.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+        self._colony_rendered_depots = None
+
+        self.tab_frames["colony"] = frame
+        self.tab_canvases["colony"] = canvas
+        self.colony_canvas = canvas
+
+    def _render_colonization(self, depots):
+        # depots is a dict keyed by market_id — compare against a snapshot
+        # signature so this only rebuilds widgets when something real changed.
+        signature = tuple(sorted(
+            (mid, d["progress"], d["complete"], d["failed"],
+             tuple((r["name"], r["required"], r["provided"]) for r in d["resources"]))
+            for mid, d in depots.items()
+        ))
+        if signature == self._colony_rendered_depots:
+            return
+        self._colony_rendered_depots = signature
+
+        for w in self.colony_cards_frame.winfo_children():
+            w.destroy()
+
+        if not depots:
+            self.colony_status_var.set(
+                "No active construction site tracked yet — dock at one to populate this.")
+            return
+        self.colony_status_var.set(f"Tracking {len(depots)} construction site(s).")
+
+        for market_id, depot in depots.items():
+            card = tk.Frame(self.colony_cards_frame, bg=PANEL_BG, highlightthickness=1,
+                             highlightbackground="#2a2a2a")
+            card.pack(fill="x", pady=4)
+
+            loc_bits = [b for b in (depot.get("system"), depot.get("station")) if b]
+            title = " — ".join(loc_bits) if loc_bits else f"Construction site (MarketID {market_id})"
+            header_row = tk.Frame(card, bg=PANEL_BG)
+            header_row.pack(fill="x", padx=8, pady=(6, 2))
+            tk.Label(header_row, text=title, font=FONT_TITLE, bg=PANEL_BG, fg=ACCENT,
+                     anchor="w").pack(side="left")
+            if depot.get("complete"):
+                tk.Label(header_row, text="Complete", font=FONT_SMALL_BOLD, bg=PANEL_BG,
+                         fg=GOOD).pack(side="right")
+            elif depot.get("failed"):
+                tk.Label(header_row, text="Failed", font=FONT_SMALL_BOLD, bg=PANEL_BG,
+                         fg=BAD).pack(side="right")
+
+            pct = (depot.get("progress") or 0) * 100
+            bar_row = tk.Frame(card, bg=PANEL_BG)
+            bar_row.pack(fill="x", padx=8, pady=(0, 4))
+            bar = Bar(bar_row, width=200, height=10)
+            bar.set_pct(pct)
+            bar.pack(side="left")
+            tk.Label(bar_row, text=f"{pct:.0f}% complete", font=FONT_SMALL, bg=PANEL_BG,
+                     fg=MUTED).pack(side="left", padx=(8, 0))
+
+            resources = depot.get("resources") or []
+            remaining = [r for r in resources if r["provided"] < r["required"]]
+            if remaining:
+                tk.Label(card, text="Still needed:", font=FONT_SMALL_BOLD, bg=PANEL_BG, fg=FG,
+                         anchor="w").pack(fill="x", padx=8, pady=(2, 0))
+                for r in sorted(remaining, key=lambda r: r["required"] - r["provided"], reverse=True):
+                    still = r["required"] - r["provided"]
+                    tk.Label(card, text=f"• {r['name']}: {still:,} more needed "
+                                         f"({r['provided']:,} / {r['required']:,})",
+                             font=FONT_SMALL, bg=PANEL_BG, fg=MUTED, anchor="w").pack(
+                        fill="x", padx=(16, 8), pady=1)
+            else:
+                tk.Label(card, text="All required commodities delivered.", font=FONT_SMALL,
+                         bg=PANEL_BG, fg=GOOD, anchor="w").pack(fill="x", padx=8, pady=(2, 6))
+            tk.Frame(card, bg=PANEL_BG, height=6).pack()
+
     # ---------- Tick ----------
 
     def _tick(self):
@@ -3144,6 +3267,7 @@ class App:
         self._render_recommendation(state)
         self._render_nav_suggestion(state)
         self._poll_personalization()
+        self._render_colonization(state.get("colonization_depots", {}))
 
         if self.build_slug:
             ship_status, ship_error, ship_loaded_slug = self.ship_store.get_snapshot()
