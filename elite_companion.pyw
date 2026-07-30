@@ -30,7 +30,7 @@ TICK_INTERVAL_MS = 1000
 # Bump both of these together whenever a real change is pushed to the repo —
 # the app compares its own APP_VERSION against the VERSION file living at
 # the repo root to know when a newer copy is available.
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 APP_REPO = "Neffyy/elite-dangerous-companion"
 APP_REPO_URL = f"https://github.com/{APP_REPO}"
 APP_VERSION_URL = f"https://raw.githubusercontent.com/{APP_REPO}/main/VERSION"
@@ -117,6 +117,19 @@ RANK_ALLEGIANCE = {"Federation": "Federation", "Empire": "Empire"}
 # for genuinely virgin systems rather than a guess.
 EDSM_BODIES_URL = "https://www.edsm.net/api-system-v1/bodies"
 UNEXPLORED_CANDIDATE_LIMIT = 15  # how many nearby systems to check per search
+
+# Trade routes: EDSM's per-system stations list (which stations have a
+# market, plus a real per-service update timestamp) and per-station market
+# endpoint (real buy/sell price, stock, demand — confirmed live via a direct
+# test query) together give a real, live-computed trade route, no EDDB-style
+# dedicated trade API needed. Capped tightly since this is one HTTP request
+# per station checked, same "bounded thoroughness" tradeoff as Exploration's
+# UNEXPLORED_CANDIDATE_LIMIT.
+EDSM_STATIONS_URL = "https://www.edsm.net/api-system-v1/stations"
+EDSM_MARKET_URL = "https://www.edsm.net/api-system-v1/stations/market"
+TRADE_ROUTE_SYSTEM_LIMIT = 8
+TRADE_ROUTE_STATION_LIMIT = 25
+MIN_TRADE_ROUTE_QTY = 10  # skip routes whose real stock/demand can't fill even this many units
 
 # "Materials on them" covers two distinct real things, both queryable from
 # Spansh's public bodies/search API: planetary surface raw materials (for
@@ -1368,6 +1381,160 @@ class PowerSystemFinder:
             return self.status, self.error, list(self.results)
 
 
+class TradeRouteFinder:
+    """Background-thread client that finds real buy-low/sell-high commodity
+    routes near a reference system, using EDSM's per-system stations list
+    and per-station market endpoints (both confirmed live via direct test
+    queries — no dedicated trade-route API exists anymore, but these two
+    together are enough). Not thread-safe by itself — all state access goes
+    through self.lock."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.status = "idle"  # idle | loading | ready | error
+        self.error = None
+        self.results = []
+        self.checked_stations = 0
+
+    def find(self, origin_system, radius_ly, cargo_capacity=None):
+        t = threading.Thread(target=self._worker, args=(origin_system, radius_ly, cargo_capacity),
+                              daemon=True)
+        t.start()
+
+    def _worker(self, origin_system, radius_ly, cargo_capacity):
+        with self.lock:
+            self.status = "loading"
+            self.error = None
+            self.results = []
+            self.checked_stations = 0
+
+        query = urllib.parse.urlencode({"systemName": origin_system, "radius": radius_ly, "showInformation": 1})
+        try:
+            nearby = _fetch_json(f"{EDSM_SPHERE_URL}?{query}")
+        except (URLError, OSError, ValueError) as exc:
+            with self.lock:
+                self.status, self.error = "error", f"Request failed: {exc}"
+            return
+        if not isinstance(nearby, list):
+            with self.lock:
+                self.status, self.error = "error", "Unexpected response from EDSM."
+            return
+
+        # Always include the origin system itself (distance 0), then the
+        # nearest others, closest first — capped tightly since every
+        # candidate costs a stations-list request plus one per market.
+        candidates = [{"name": origin_system, "distance": 0.0}] + sorted(
+            (s for s in nearby if s.get("name") != origin_system and s.get("distance")),
+            key=lambda s: s["distance"])
+        candidates = candidates[:TRADE_ROUTE_SYSTEM_LIMIT]
+
+        entries = []
+        checked = 0
+        for cand in candidates:
+            if checked >= TRADE_ROUTE_STATION_LIMIT:
+                break
+            try:
+                st_query = urllib.parse.urlencode({"systemName": cand["name"]})
+                st_data = _fetch_json(f"{EDSM_STATIONS_URL}?{st_query}")
+            except (URLError, OSError, ValueError):
+                continue
+            stations = (st_data or {}).get("stations") or []
+            for st in stations:
+                if not st.get("haveMarket") or checked >= TRADE_ROUTE_STATION_LIMIT:
+                    continue
+                checked += 1
+                with self.lock:
+                    self.checked_stations = checked
+                try:
+                    mk_query = urllib.parse.urlencode(
+                        {"systemName": cand["name"], "stationName": st["name"]})
+                    mk_data = _fetch_json(f"{EDSM_MARKET_URL}?{mk_query}")
+                except (URLError, OSError, ValueError):
+                    continue
+                commodities = (mk_data or {}).get("commodities") or []
+                if not commodities:
+                    continue
+                entries.append({
+                    "system": cand["name"], "distance": cand["distance"], "station": st["name"],
+                    "updated": (st.get("updateTime") or {}).get("market"),
+                    "commodities": commodities,
+                })
+
+        routes = self._compute_routes(entries, cargo_capacity)
+        with self.lock:
+            self.results = routes
+            self.status = "ready"
+
+    @staticmethod
+    def _compute_routes(entries, cargo_capacity):
+        # Real EDSM/EDDN commodity-market field semantics, confirmed against
+        # live data (not the intuitive-sounding pairing — verified directly:
+        # e.g. Sol/Abraham Lincoln shows Advanced Medicines at buyPrice=0,
+        # stock=0, sellPrice=1727, demand=459785 — a high-tech consumer
+        # economy that imports medicine, so it makes sense as a place to
+        # SELL it, not buy it; conversely an industrial station's Biowaste
+        # shows buyPrice=109, stock=78658, sellPrice=65, demand=1 — a
+        # producer with plenty to sell off, no interest in more):
+        # "buyPrice" is what WE pay to buy from the station (paired with
+        # "stock" — what it has available), "sellPrice" is what WE receive
+        # selling to the station (paired with "demand" — what it wants).
+        #
+        # The MIN_TRADE_ROUTE_QTY floor is applied HERE, before picking the
+        # best price per commodity — not as a filter on the winner afterward.
+        # Picking globally-best-price-regardless-of-stock first (verified
+        # against real EDSM data near Sol and Robigo) systematically surfaced
+        # stock=1/demand=1 outlier listings, since the single cheapest quote
+        # for a commodity is disproportionately likely to be a near-empty or
+        # stale crowd-sourced entry — even though stock/demand in the tens of
+        # thousands genuinely exists at other stations for the same
+        # commodity. Requiring the floor up front means "best price" is only
+        # ever chosen among listings that were actually tradeable in bulk.
+        best_buy = {}
+        best_sell = {}
+        for entry in entries:
+            for c in entry["commodities"]:
+                cid = c.get("id")
+                if not cid:
+                    continue
+                buy_price = c.get("buyPrice") or 0
+                if buy_price > 0 and c.get("stock", 0) >= MIN_TRADE_ROUTE_QTY:
+                    if cid not in best_buy or buy_price < best_buy[cid][0]:
+                        best_buy[cid] = (buy_price, entry, c)
+                sell_price = c.get("sellPrice") or 0
+                if sell_price > 0 and c.get("demand", 0) >= MIN_TRADE_ROUTE_QTY:
+                    if cid not in best_sell or sell_price > best_sell[cid][0]:
+                        best_sell[cid] = (sell_price, entry, c)
+
+        routes = []
+        for cid, (buy_price, buy_entry, buy_c) in best_buy.items():
+            sell = best_sell.get(cid)
+            if not sell:
+                continue
+            sell_price, sell_entry, sell_c = sell
+            margin = sell_price - buy_price
+            if margin <= 0:
+                continue
+            qty = min(buy_c.get("stock", 0), sell_c.get("demand", 0))
+            if cargo_capacity:
+                qty = min(qty, int(cargo_capacity))
+            routes.append({
+                "commodity": buy_c.get("name", cid),
+                "buy_system": buy_entry["system"], "buy_station": buy_entry["station"],
+                "buy_distance": buy_entry["distance"], "buy_price": buy_price,
+                "buy_updated": buy_entry["updated"],
+                "sell_system": sell_entry["system"], "sell_station": sell_entry["station"],
+                "sell_distance": sell_entry["distance"], "sell_price": sell_price,
+                "sell_updated": sell_entry["updated"],
+                "margin": margin, "quantity": qty, "est_profit": margin * qty,
+            })
+        routes.sort(key=lambda r: r["est_profit"], reverse=True)
+        return routes[:15]
+
+    def get_snapshot(self):
+        with self.lock:
+            return self.status, self.error, self.checked_stations, list(self.results)
+
+
 def _extract_module_entries(data):
     """coriolis-data module files are {"<group-code>": [...entries]} — pull
     the list out defensively regardless of the exact key name."""
@@ -1754,6 +1921,8 @@ class App:
         self.material_finder = MaterialSearchFinder()
         self._material_last_status = None
         self.material_mode = "surface"
+        self.trade_finder = TradeRouteFinder()
+        self._trade_last_status = None
         # Separate instances (not shared with the Explore tab's finders above)
         # so the Guide tab's fixed auto-query (current system, Painite) can't
         # clobber whatever the user manually searched for in Explore, or vice
@@ -2528,6 +2697,48 @@ class App:
         self.nav_results_frame = tk.Frame(inner, bg=BG)
         self.nav_results_frame.pack(fill="both", expand=True, padx=10, pady=(0, 6))
 
+        # --- Trade route finder ---
+        trade_box = tk.LabelFrame(inner, text=" Trade Route Finder ", bg=BG, fg=MUTED,
+                                   labelanchor="nw", bd=1, relief="solid",
+                                   highlightbackground="#2a2a2a")
+        trade_box.pack(fill="x", padx=10, pady=(4, 4))
+
+        trade_row1 = tk.Frame(trade_box, bg=BG)
+        trade_row1.pack(fill="x", padx=8, pady=(8, 3))
+        tk.Label(trade_row1, text="From:", font=FONT_SMALL_BOLD, bg=BG, fg=FG,
+                 width=8, anchor="w").pack(side="left")
+        self.trade_origin_entry = tk.Entry(trade_row1, bg=PANEL_BG, fg=FG, insertbackground=FG,
+                                            relief="flat", font=FONT_BODY)
+        self.trade_origin_entry.pack(side="left", fill="x", expand=True, ipady=2)
+        trade_use_current_btn = tk.Label(trade_row1, text="Use current", font=FONT_SMALL_BOLD,
+                                          bg=CARD_BG, fg=ACCENT, cursor="hand2", padx=6, pady=2)
+        trade_use_current_btn.pack(side="left", padx=(6, 0))
+        trade_use_current_btn.bind("<Button-1>", lambda e: self._use_current_system_into(self.trade_origin_entry))
+
+        trade_row2 = tk.Frame(trade_box, bg=BG)
+        trade_row2.pack(fill="x", padx=8, pady=3)
+        tk.Label(trade_row2, text="Radius:", font=FONT_SMALL_BOLD, bg=BG, fg=FG,
+                 width=8, anchor="w").pack(side="left")
+        self.trade_radius_entry = tk.Entry(trade_row2, bg=PANEL_BG, fg=FG, insertbackground=FG,
+                                            relief="flat", font=FONT_BODY, width=6)
+        self.trade_radius_entry.insert(0, str(EDSM_RADIUS_LY))
+        self.trade_radius_entry.pack(side="left", ipady=2)
+        tk.Label(trade_row2, text="ly", font=FONT_SMALL, bg=BG, fg=MUTED).pack(side="left", padx=(4, 8))
+        trade_find_btn = tk.Label(trade_row2, text="Find", font=FONT_SMALL_BOLD, bg=ACCENT,
+                                   fg="#0a0a0a", cursor="hand2", padx=10, pady=3)
+        trade_find_btn.pack(side="left")
+        trade_find_btn.bind("<Button-1>", self._find_trade_routes)
+
+        self.trade_status_var = tk.StringVar(
+            value=f"Checks real station markets via EDSM (buy/sell price, stock, demand) — slow "
+                  f"(one request per station, capped at {TRADE_ROUTE_STATION_LIMIT}). Routes need real "
+                  f"stock/demand of at least {MIN_TRADE_ROUTE_QTY} units, not just the best quoted price.")
+        tk.Label(trade_box, textvariable=self.trade_status_var, font=FONT_SMALL, bg=BG,
+                 fg=MUTED, anchor="w", justify="left", wraplength=440).pack(fill="x", padx=8, pady=(0, 4))
+
+        self.trade_results_frame = tk.Frame(trade_box, bg=BG)
+        self.trade_results_frame.pack(fill="x", padx=8, pady=(0, 8))
+
         self.tab_frames["nav"] = frame
         self.tab_canvases["nav"] = canvas
         self.nav_canvas = canvas
@@ -2636,6 +2847,64 @@ class App:
                 sub = f"{wp.get('jumps', 0)} jump(s) · {wp.get('distance_jumped', 0):,.1f} ly"
             tk.Label(row, text=sub, font=FONT_SMALL, bg=CARD_BG, fg=MUTED,
                      anchor="e").pack(side="right", padx=6)
+
+    def _find_trade_routes(self, event=None):
+        origin = self.trade_origin_entry.get().strip()
+        if not origin:
+            self.trade_status_var.set("Enter a starting system (or click Use current).")
+            return
+        try:
+            radius = float(self.trade_radius_entry.get().strip())
+            if radius <= 0:
+                raise ValueError
+        except ValueError:
+            self.trade_status_var.set("Radius must be a positive number of light years.")
+            return
+        state, _ = self.watcher.get_snapshot()
+        cargo_capacity = state.get("cargo_capacity")
+        self.trade_status_var.set(f"Checking station markets near {origin} (this can take a while)...")
+        for w in self.trade_results_frame.winfo_children():
+            w.destroy()
+        self._trade_last_status = None
+        self.trade_finder.find(origin, radius, cargo_capacity)
+
+    def _render_trade_routes(self, status, error, checked, results):
+        if status == "loading":
+            self.trade_status_var.set(f"Checked {checked} station(s) so far...")
+            return
+        if status == "error":
+            self.trade_status_var.set(f"Error: {error}")
+            return
+        if status != "ready":
+            return
+        for w in self.trade_results_frame.winfo_children():
+            w.destroy()
+        if not results:
+            self.trade_status_var.set(
+                f"No route found with real stock/demand of at least {MIN_TRADE_ROUTE_QTY} units "
+                f"in range — try a larger radius.")
+            return
+        self.trade_status_var.set(f"{len(results)} route(s) found (checked {checked} station(s)).")
+        for r in results:
+            row = tk.Frame(self.trade_results_frame, bg=CARD_BG, highlightthickness=1,
+                            highlightbackground=CARD_BORDER)
+            row.pack(fill="x", pady=2)
+            text_col = tk.Frame(row, bg=CARD_BG)
+            text_col.pack(side="left", fill="x", expand=True, padx=6, pady=4)
+            tk.Label(text_col, text=f"{r['commodity']} — {r['margin']:,} CR/unit "
+                                     f"(~{r['est_profit']:,.0f} CR for {r['quantity']:,} units)",
+                     font=FONT_SMALL_BOLD, bg=CARD_BG, fg=FG, anchor="w").pack(fill="x")
+            tk.Label(text_col, text=f"Buy {r['buy_price']:,} CR @ {r['buy_station']} "
+                                     f"({r['buy_system']}, {r['buy_distance']:.1f} ly)",
+                     font=FONT_SMALL, bg=CARD_BG, fg=MUTED, anchor="w").pack(fill="x")
+            tk.Label(text_col, text=f"Sell {r['sell_price']:,} CR @ {r['sell_station']} "
+                                     f"({r['sell_system']}, {r['sell_distance']:.1f} ly) "
+                                     f"— market data from {r['sell_updated'] or 'unknown time'}",
+                     font=FONT_SMALL, bg=CARD_BG, fg=MUTED, anchor="w").pack(fill="x")
+            go_btn = tk.Label(row, text="Go", font=FONT_SMALL_BOLD, bg=CARD_BG, fg=ACCENT,
+                               cursor="hand2", padx=6)
+            go_btn.pack(side="right", padx=(0, 6))
+            go_btn.bind("<Button-1>", lambda e, n=r["buy_system"]: self._on_explore_go(n))
 
     # ---------- Build tab ----------
 
@@ -3288,6 +3557,12 @@ class App:
         if material_status != self._material_last_status:
             self._material_last_status = material_status
             self._render_material_results(material_status, material_error, material_results)
+
+        trade_status, trade_error, trade_checked, trade_results = self.trade_finder.get_snapshot()
+        trade_signature = (trade_status, trade_checked)
+        if trade_signature != self._trade_last_status:
+            self._trade_last_status = trade_signature
+            self._render_trade_routes(trade_status, trade_error, trade_checked, trade_results)
 
         update_status, _update_error, latest_version = self.update_checker.get_snapshot()
         if update_status != self._update_last_status:
