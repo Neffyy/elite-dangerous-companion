@@ -30,7 +30,7 @@ TICK_INTERVAL_MS = 1000
 # Bump both of these together whenever a real change is pushed to the repo —
 # the app compares its own APP_VERSION against the VERSION file living at
 # the repo root to know when a newer copy is available.
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 APP_REPO = "Neffyy/elite-dangerous-companion"
 APP_REPO_URL = f"https://github.com/{APP_REPO}"
 APP_VERSION_URL = f"https://raw.githubusercontent.com/{APP_REPO}/main/VERSION"
@@ -139,6 +139,14 @@ RING_SIGNALS = [
     "Serendibite", "Tritium", "Uraninite", "Void Opal", "Water",
 ]
 MATERIAL_SEARCH_RADIUS_LY = 100
+
+# Real per-system Powerplay control data (which Power, and its control state
+# e.g. Stronghold/Fortified/Exploited/Turmoil) isn't exposed by EDSM's system
+# endpoints (checked — its "information" block only has allegiance/faction/
+# security/economy) but IS a real, live-queryable field on Spansh's systems
+# search API, confirmed via a direct test query.
+SPANSH_SYSTEMS_URL = "https://spansh.co.uk/api/systems/search"
+POWER_HUB_RADIUS_LY = 100
 
 # Data for the Build tab comes live from EDCD's coriolis-data (MIT licensed,
 # the dataset behind Coriolis.io/EDSY) rather than being hand-typed here —
@@ -524,8 +532,11 @@ ACTIVITY_HUBS = {
 # slots block, since fitted loadouts aren't known for ships other than the
 # one currently being flown), and where its navigation suggestion should come
 # from. Exploration/Mining get a real specific destination; everything else
-# with a nav section gets a general nearby hub; Powerplay/CQC get neither —
-# Powerplay depends on an unknown pledged Power, CQC has no galaxy location.
+# with a nav section gets a general nearby hub; Powerplay gets a real nearest-
+# system-for-your-pledged-Power lookup (see PowerSystemFinder); CQC gets
+# neither — it has no galaxy location at all. Powerplay stays out of
+# PATH_STAT_CATEGORY since no hull stat makes one ship better for it than
+# another (ship-agnostic messaging already handles a missing key here).
 PATH_STAT_CATEGORY = {
     "trading": "cargo", "mining": "cargo", "missions": "cargo", "engineering": "cargo",
     "combat": "hardpoint", "piracy": "hardpoint", "war_support": "hardpoint",
@@ -538,7 +549,7 @@ STAT_CATEGORY_LABEL = {
     "fsd": "Frame Shift Drive class",
 }
 PATH_NAV_MODE = {
-    "exploration": "unexplored", "mining": "material",
+    "exploration": "unexplored", "mining": "material", "powerplay": "power_hub",
     "trading": "hub", "missions": "hub", "combat": "hub", "piracy": "hub",
     "war_support": "hub", "thargoid_war": "hub", "engineering": "hub",
 }
@@ -641,6 +652,8 @@ SAMPLE_EVENTS = [
      "Credits": 25000000, "GameMode": "Open"},
     {"timestamp": "2026-07-24T10:00:02Z", "event": "Rank", "Combat": 3, "Trade": 2,
      "Explore": 4, "CQC": 0, "Federation": 2, "Empire": 0},
+    {"timestamp": "2026-07-24T10:00:02Z", "event": "Powerplay", "Power": "Aisling Duval",
+     "Rank": 3, "Merits": 4200, "Votes": 0, "TimePledged": 2592000},
     {"timestamp": "2026-07-24T10:00:02Z", "event": "Progress", "Combat": 42, "Trade": 15,
      "Explore": 63, "CQC": 0, "Federation": 5, "Empire": 0},
     {"timestamp": "2026-07-24T10:00:03Z", "event": "Location", "StarSystem": "Shinrarta Dezhra",
@@ -748,6 +761,7 @@ def new_state():
         "stored_modules": set(),  # item symbols sitting unused in Storage, galaxy-wide
         "cargo_capacity": None,   # current ship only, from Loadout
         "owned_ships": [],        # [{"ship_internal": str, "system": str|None}, ...] from StoredShips
+        "powerplay": None,        # {"power","rank","merits","votes","time_pledged"} or None if unpledged
     }
 
 
@@ -883,6 +897,19 @@ class JournalWatcher:
                     continue
                 ships.append({"ship_internal": ship_type, "system": entry.get("StarSystem")})
             self.state["owned_ships"] = ships
+        elif et == "Powerplay":
+            # Fires once at startup only if the commander is currently
+            # pledged — real Power/Rank/Merits, not derivable from Rank or
+            # Progress (neither of which carries a Powerplay component).
+            self.state["powerplay"] = {
+                "power": e.get("Power"),
+                "rank": e.get("Rank"),
+                "merits": e.get("Merits"),
+                "votes": e.get("Votes"),
+                "time_pledged": e.get("TimePledged"),
+            }
+        elif et == "PowerplayLeave":
+            self.state["powerplay"] = None
         elif et == "Rank":
             for k in RANK_KEYS:
                 if k in e:
@@ -1241,6 +1268,70 @@ class MaterialSearchFinder:
             "distance": r.get("distance", 0),
             "detail": detail,
         }
+
+    def get_snapshot(self):
+        with self.lock:
+            return self.status, self.error, list(self.results)
+
+
+class PowerSystemFinder:
+    """Background-thread client for Spansh's public systems/search API — used
+    to find the nearest real system associated with the player's pledged
+    Power (for Guide personalization's Powerplay card). Not thread-safe by
+    itself — all state access goes through self.lock."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.status = "idle"  # idle | loading | ready | error
+        self.error = None
+        self.results = []
+
+    def find(self, reference_system, power_name, radius_ly):
+        t = threading.Thread(target=self._worker,
+                              args=(reference_system, power_name, radius_ly), daemon=True)
+        t.start()
+
+    def _worker(self, reference_system, power_name, radius_ly):
+        with self.lock:
+            self.status = "loading"
+            self.error = None
+            self.results = []
+        payload = {
+            "filters": {"power": {"value": [power_name]}},
+            "sort": [{"distance": {"direction": "asc"}}],
+            "size": 10,
+            "reference_system": reference_system,
+        }
+        try:
+            req = Request(SPANSH_SYSTEMS_URL, data=json.dumps(payload).encode("utf-8"),
+                          headers={**UA_HEADERS, "Content-Type": "application/json"})
+            with urlopen(req, timeout=20) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except (URLError, OSError, ValueError) as exc:
+            with self.lock:
+                self.status, self.error = "error", f"Request failed: {exc}"
+            return
+        if not isinstance(data, dict) or data.get("error"):
+            with self.lock:
+                self.status = "error"
+                self.error = data.get("error", "Unexpected response") if isinstance(data, dict) else "Unexpected response"
+            return
+
+        parsed = []
+        for r in data.get("results") or []:
+            distance = r.get("distance", 0)
+            if radius_ly and distance > radius_ly:
+                continue
+            parsed.append({
+                "system": r.get("name", "?"),
+                "distance": distance,
+                "power_state": r.get("power_state") or "?",
+                "controlling_power": r.get("controlling_power"),
+            })
+
+        with self.lock:
+            self.results = parsed
+            self.status = "ready"
 
     def get_snapshot(self):
         with self.lock:
@@ -1639,8 +1730,10 @@ class App:
         # versa — both wrap the same finder classes.
         self.guide_unexplored_finder = UnexploredFinder()
         self.guide_material_finder = MaterialSearchFinder()
+        self.guide_power_finder = PowerSystemFinder()
         self._guide_unexplored_origin = None
         self._guide_material_origin = None
+        self._guide_power_query = None
         self.guide_subtab = "general"
         self._owned_ships_signature = None
         self._ship_recommendations = {}
@@ -2014,6 +2107,14 @@ class App:
             self.guide_material_finder.search(current_system, "ring", MINING_NAV_COMMODITY,
                                                MATERIAL_SEARCH_RADIUS_LY)
 
+        power_name = (state.get("powerplay") or {}).get("power")
+        power_query = (power_name, current_system) if power_name and current_system else None
+        if power_query and power_query != self._guide_power_query:
+            self._guide_power_query = power_query
+            self.guide_power_finder.find(current_system, power_name, POWER_HUB_RADIUS_LY)
+        elif not power_query:
+            self._guide_power_query = None
+
         self._render_guide_personal(state, missing)
         self._render_guide_personal_status(state, missing)
 
@@ -2068,11 +2169,20 @@ class App:
         return f"Best owned ship for this: {name} (hull {label}: {score} — unfitted hull capacity, not a live loadout)."
 
     def _personal_nav_line(self, nav_mode, current_system, nearest_unexplored,
-                            nearest_material, nearest_hub):
+                            nearest_material, nearest_hub, powerplay=None, nearest_power_system=None):
         if nav_mode is None:
             return "No single destination applies for this — see the tips above.", None
         if not current_system:
             return "Current system unknown yet — play a session or load sample data.", None
+        if nav_mode == "power_hub":
+            if not powerplay:
+                return "Not pledged to a Power yet — pledge in-game to get a destination here.", None
+            if nearest_power_system is None:
+                return (f"Looking for a system tied to {powerplay['power']} near "
+                         f"{current_system}...", None)
+            return (f"Nearest {powerplay['power']} system: {nearest_power_system['system']} "
+                     f"({nearest_power_system['distance']:.1f} ly, {nearest_power_system['power_state']})",
+                    nearest_power_system["system"])
         if nav_mode == "unexplored":
             if nearest_unexplored is None:
                 return (f"Looking for an unexplored system near {current_system} "
@@ -2106,6 +2216,9 @@ class App:
         nearest_material = min(material_results, key=lambda r: r["distance"]) if material_results else None
         _status, _error, nearby_origin, nearby_results = self.nearby_finder.get_snapshot()
         nearest_hub = nearest_populated_system(nearby_results) if nearby_origin == current_system else None
+        _status, _error, power_results = self.guide_power_finder.get_snapshot()
+        nearest_power_system = min(power_results, key=lambda r: r["distance"]) if power_results else None
+        powerplay = state.get("powerplay")
 
         loading = bool(missing_slugs)
         for path in PATHS:
@@ -2115,7 +2228,8 @@ class App:
                                                   cargo_capacity, max_jump_range, fitted_hardpoints)
             nav_mode = PATH_NAV_MODE.get(path["key"])
             nav_line, nav_system = self._personal_nav_line(nav_mode, current_system, nearest_unexplored,
-                                                             nearest_material, nearest_hub)
+                                                             nearest_material, nearest_hub,
+                                                             powerplay, nearest_power_system)
             panel.update_personalization(ship_line, nav_line, nav_system)
 
     def _render_guide_personal_status(self, state, missing_slugs):
@@ -2158,6 +2272,14 @@ class App:
         self.credits_delta_label = tk.Label(credits_box, textvariable=self.credits_delta_var,
                                              font=FONT_SMALL, bg=PANEL_BG, fg=MUTED, anchor="w")
         self.credits_delta_label.pack(anchor="w", padx=8, pady=(0, 6))
+
+        self.powerplay_box = tk.Frame(inner, bg=PANEL_BG, highlightthickness=1,
+                                       highlightbackground="#2a2a2a")
+        self.powerplay_var = tk.StringVar(value="")
+        tk.Label(self.powerplay_box, textvariable=self.powerplay_var, font=FONT_BODY,
+                 bg=PANEL_BG, fg=FG, anchor="w").pack(fill="x", padx=8, pady=6)
+        # Not packed yet — shown only once a real Powerplay pledge is seen
+        # (the event only fires at startup if the commander is pledged).
 
         ranks_box = tk.LabelFrame(inner, text=" Ranks ", bg=BG, fg=MUTED, labelanchor="nw",
                                    bd=1, relief="solid", highlightbackground="#2a2a2a")
@@ -2252,6 +2374,18 @@ class App:
         self.nav_dest_entry.delete(0, "end")
         self.nav_dest_entry.insert(0, system_name)
         self._use_current_system()
+
+    def _render_powerplay_box(self, powerplay):
+        if not powerplay or not powerplay.get("power"):
+            if self.powerplay_box.winfo_manager():
+                self.powerplay_box.pack_forget()
+            return
+        days = (powerplay.get("time_pledged") or 0) // 86400
+        self.powerplay_var.set(
+            f"Powerplay: pledged to {powerplay['power']} — Rank {powerplay.get('rank', '?')}, "
+            f"{powerplay.get('merits', 0):,} merits ({days}d pledged)")
+        if not self.powerplay_box.winfo_manager():
+            self.powerplay_box.pack(fill="x", padx=10, pady=4, before=self.rank_cols_row.master)
 
     def _render_rank_suggestions(self, current_system):
         if not current_system:
@@ -2957,6 +3091,7 @@ class App:
         self.ship_var.set(f"Ship: {ship_display(state.get('ship_internal'))}")
         loc_bits = [b for b in (state.get("system"), state.get("station")) if b]
         self.loc_var.set("Location: " + (" — ".join(loc_bits) if loc_bits else "--"))
+        self._render_powerplay_box(state.get("powerplay"))
 
         credits = state.get("credits")
         self.credits_var.set(fmt_credits(credits))
