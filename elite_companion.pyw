@@ -31,7 +31,7 @@ TICK_INTERVAL_MS = 1000
 # Bump both of these together whenever a real change is pushed to the repo —
 # the app compares its own APP_VERSION against the VERSION file living at
 # the repo root to know when a newer copy is available.
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 APP_REPO = "Neffyy/elite-dangerous-companion"
 APP_REPO_URL = f"https://github.com/{APP_REPO}"
 APP_VERSION_URL = f"https://raw.githubusercontent.com/{APP_REPO}/main/VERSION"
@@ -43,13 +43,26 @@ DEFAULT_VIEW_MODES = {"guide": "auto", "tracker": "auto", "nav": "auto", "build"
                        "colony": "auto"}
 GEOMETRY_RE = re.compile(r"^(\d+)x(\d+)([+-]\d+)([+-]\d+)$")
 
-# In-game overlay: a color-keyed transparent Toplevel (Tk's real, standard
-# Windows transparency mechanism — no memory reading, no DirectX hooking,
-# same category of technique legitimate tools like EDMC's overlay plugins
-# use), click-through by default via the Win32 WS_EX_TRANSPARENT extended
-# style so it never blocks input to the game underneath.
+# In-game overlay: a color-keyed transparent Toplevel per card (Tk's real,
+# standard Windows transparency mechanism — no memory reading, no DirectX
+# hooking, same category of technique legitimate tools like EDMC's overlay
+# plugins use), click-through by default via the Win32 WS_EX_TRANSPARENT
+# extended style so it never blocks input to the game underneath. Each card
+# is its own independent window — separately shown/hidden, moved, and
+# resized — rather than one fixed panel.
 OVERLAY_TRANSPARENT_KEY = "#010203"
-DEFAULT_OVERLAY_POS = "+40+40"
+OVERLAY_CARDS = [
+    ("status", "Status"),
+    ("location", "Location"),
+    ("suggestion", "Suggestion"),
+    ("route", "Route"),
+]
+DEFAULT_OVERLAY_CARD_GEOMETRY = {
+    "status": "200x50+40+40",
+    "location": "200x50+40+100",
+    "suggestion": "240x70+40+160",
+    "route": "220x50+40+240",
+}
 
 
 def load_settings():
@@ -2005,6 +2018,121 @@ def set_overlay_click_through(toplevel, enabled):
         pass
 
 
+class OverlayCard:
+    """One independent overlay panel — its own transparent, click-through-
+    when-locked Toplevel, separately shown/hidden, dragged, and resized from
+    every other card. Locked by default (click-through); an explicit
+    unlock enables both drag-to-move (grab anywhere on the card) and
+    drag-to-resize (the bottom-right corner grip)."""
+
+    MIN_W, MIN_H = 140, 44
+
+    def __init__(self, root, key, title):
+        self.key = key
+        self.locked = True
+        self._drag_origin = None
+        self._resize_origin = None
+
+        win = tk.Toplevel(root)
+        win.title(f"Elite Dangerous Companion Overlay - {key}")
+        win.withdraw()
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg=OVERLAY_TRANSPARENT_KEY)
+        try:
+            win.attributes("-transparentcolor", OVERLAY_TRANSPARENT_KEY)
+        except tk.TclError:
+            pass  # non-Windows Tk builds don't support color-key transparency
+        self.win = win
+
+        content = tk.Frame(win, bg=PANEL_BG, highlightthickness=1, highlightbackground=ACCENT)
+        content.pack(fill="both", expand=True)
+        self.content = content
+
+        header = tk.Frame(content, bg=PANEL_BG)
+        header.pack(fill="x", padx=6, pady=(4, 2))
+        tk.Label(header, text=title.upper(), font=FONT_SMALL_BOLD, bg=PANEL_BG,
+                 fg=ACCENT).pack(side="left")
+        self.lock_hint_var = tk.StringVar(value="")
+        tk.Label(header, textvariable=self.lock_hint_var, font=FONT_SMALL, bg=PANEL_BG,
+                 fg=MUTED).pack(side="right")
+
+        self.text_var = tk.StringVar(value="--")
+        self.text_label = tk.Label(content, textvariable=self.text_var, font=FONT_SMALL,
+                                    bg=PANEL_BG, fg=FG, anchor="nw", justify="left", wraplength=180)
+        self.text_label.pack(fill="both", expand=True, padx=6, pady=(0, 4))
+
+        self.grip = tk.Label(content, text="◢", font=FONT_SMALL, bg=PANEL_BG, fg=MUTED)
+        self.grip.place(relx=1.0, rely=1.0, anchor="se")
+
+        def _bind_drag_recursive(widget):
+            if widget is self.grip:
+                return
+            widget.bind("<Button-1>", self._drag_start)
+            widget.bind("<B1-Motion>", self._drag_motion)
+            for child in widget.winfo_children():
+                _bind_drag_recursive(child)
+        _bind_drag_recursive(content)
+        self.grip.bind("<Button-1>", self._resize_start)
+        self.grip.bind("<B1-Motion>", self._resize_motion)
+
+        set_overlay_click_through(win, True)
+
+    def _drag_start(self, event):
+        if self.locked:
+            return
+        self._drag_origin = (event.x_root, event.y_root, self.win.winfo_x(), self.win.winfo_y())
+
+    def _drag_motion(self, event):
+        if self.locked or not self._drag_origin:
+            return
+        start_x, start_y, win_x, win_y = self._drag_origin
+        self.win.geometry(f"+{win_x + (event.x_root - start_x)}+{win_y + (event.y_root - start_y)}")
+
+    def _resize_start(self, event):
+        if self.locked:
+            return
+        self._resize_origin = (event.x_root, event.y_root, self.win.winfo_width(), self.win.winfo_height())
+
+    def _resize_motion(self, event):
+        if self.locked or not self._resize_origin:
+            return
+        start_x, start_y, w0, h0 = self._resize_origin
+        new_w = max(self.MIN_W, w0 + (event.x_root - start_x))
+        new_h = max(self.MIN_H, h0 + (event.y_root - start_y))
+        self.win.geometry(f"{new_w}x{new_h}")
+        self.text_label.config(wraplength=max(80, new_w - 20))
+
+    def set_locked(self, locked):
+        self.locked = locked
+        set_overlay_click_through(self.win, locked)
+        self.lock_hint_var.set("" if locked else "drag · resize ◢")
+
+    def show(self):
+        self.win.deiconify()
+
+    def hide(self):
+        self.win.withdraw()
+
+    def is_visible(self):
+        return bool(self.win.winfo_viewable())
+
+    def set_text(self, text):
+        self.text_var.set(text)
+
+    def get_geometry(self):
+        try:
+            return self.win.geometry()
+        except tk.TclError:
+            return None
+
+    def set_geometry(self, geometry):
+        try:
+            self.win.geometry(geometry)
+        except tk.TclError:
+            pass
+
+
 def ensure_single_instance():
     ERROR_ALREADY_EXISTS = 183
     ctypes.windll.kernel32.CreateMutexW(None, False, "EliteCompanionSingleInstance")
@@ -2058,12 +2186,18 @@ class App:
         self.update_checker = UpdateChecker()
         self._update_last_status = None
 
-        self.overlay_win = None
-        self.overlay_visible = bool(self.settings.get("overlay_visible", False))
-        self.overlay_locked = True
-        saved_overlay_pos = self.settings.get("overlay_pos")
-        self.overlay_pos = saved_overlay_pos if isinstance(saved_overlay_pos, str) else DEFAULT_OVERLAY_POS
-        self._overlay_drag_origin = None
+        self.overlay_cards = {}      # key -> OverlayCard
+        self.overlay_locked = True   # shared lock/unlock applies to every card at once
+        saved_overlay = self.settings.get("overlay_cards")
+        saved_overlay = saved_overlay if isinstance(saved_overlay, dict) else {}
+        self.overlay_card_visible = {}
+        self.overlay_card_geometry = {}
+        for key, _title in OVERLAY_CARDS:
+            card_settings = saved_overlay.get(key) if isinstance(saved_overlay.get(key), dict) else {}
+            self.overlay_card_visible[key] = bool(card_settings.get("visible", False))
+            geom = card_settings.get("geometry")
+            self.overlay_card_geometry[key] = geom if isinstance(geom, str) else DEFAULT_OVERLAY_CARD_GEOMETRY[key]
+        self.overlay_settings_win = None
 
         self.tab_frames = {}
         self.tab_buttons = {}
@@ -2097,8 +2231,11 @@ class App:
             geometry = clean_geometry(self.root.geometry())
         except tk.TclError:
             geometry = None
-        settings = {"view_modes": self.view_modes, "overlay_visible": self.overlay_visible,
-                    "overlay_pos": self.overlay_pos}
+        overlay_settings = {}
+        for key, card in self.overlay_cards.items():
+            geom = card.get_geometry() or self.overlay_card_geometry.get(key)
+            overlay_settings[key] = {"visible": self.overlay_card_visible.get(key, False), "geometry": geom}
+        settings = {"view_modes": self.view_modes, "overlay_cards": overlay_settings}
         if geometry and GEOMETRY_RE.match(geometry):
             settings["window_geometry"] = geometry
         save_settings(settings)
@@ -2125,10 +2262,10 @@ class App:
         overlay_box = tk.Frame(top, bg=PANEL_BG, highlightthickness=1,
                                 highlightbackground="#2a2a2a")
         overlay_box.pack(side="right", padx=(0, 6))
-        self.overlay_show_btn = tk.Label(overlay_box, text="⧉ Overlay", font=FONT_SMALL_BOLD,
-                                          bg=PANEL_BG, fg=MUTED, cursor="hand2", padx=8, pady=3)
-        self.overlay_show_btn.pack(side="left")
-        self.overlay_show_btn.bind("<Button-1>", lambda e: self._toggle_overlay_visible())
+        self.overlay_settings_btn = tk.Label(overlay_box, text="⧉ Overlay", font=FONT_SMALL_BOLD,
+                                              bg=PANEL_BG, fg=MUTED, cursor="hand2", padx=8, pady=3)
+        self.overlay_settings_btn.pack(side="left")
+        self.overlay_settings_btn.bind("<Button-1>", lambda e: self._toggle_overlay_settings())
         self.overlay_lock_btn = tk.Label(overlay_box, text="🔒", font=FONT_SMALL_BOLD, bg=PANEL_BG,
                                           fg=MUTED, cursor="hand2", padx=8, pady=3)
         self.overlay_lock_btn.pack(side="left")
@@ -2171,9 +2308,7 @@ class App:
         self.root.geometry(f"{w}x{h}")
 
         self.update_checker.check()
-        self._build_overlay()
-        if self.overlay_visible:
-            self._show_overlay()
+        self._build_overlay_cards()
 
     def _on_update_banner_click(self, event=None):
         try:
@@ -3759,119 +3894,95 @@ class App:
 
     # ---------- In-game overlay ----------
 
-    def _build_overlay(self):
+    def _build_overlay_cards(self):
+        for key, title in OVERLAY_CARDS:
+            card = OverlayCard(self.root, key, title)
+            card.set_geometry(self.overlay_card_geometry.get(key, DEFAULT_OVERLAY_CARD_GEOMETRY[key]))
+            card.set_locked(self.overlay_locked)
+            self.overlay_cards[key] = card
+            if self.overlay_card_visible.get(key):
+                card.show()
+        self._build_overlay_settings_popup()
+
+    def _build_overlay_settings_popup(self):
         win = tk.Toplevel(self.root)
-        # A distinct title, even though overrideredirect() hides its
-        # titlebar — Tk Toplevels otherwise inherit the root window's WM_NAME,
-        # which makes the two windows indistinguishable to anything (incl.
-        # Windows UI Automation) that looks them up by name.
-        win.title("Elite Dangerous Companion Overlay")
+        win.title("Overlay Settings")
         win.withdraw()
         win.overrideredirect(True)
         win.attributes("-topmost", True)
-        win.configure(bg=OVERLAY_TRANSPARENT_KEY)
-        try:
-            win.attributes("-transparentcolor", OVERLAY_TRANSPARENT_KEY)
-        except tk.TclError:
-            pass  # non-Windows Tk builds don't support color-key transparency
-        win.geometry(self.overlay_pos)
-        self.overlay_win = win
+        win.configure(bg=PANEL_BG, highlightthickness=1, highlightbackground=ACCENT)
+        self.overlay_settings_win = win
 
-        content = tk.Frame(win, bg=PANEL_BG, highlightthickness=1, highlightbackground=ACCENT)
-        content.pack()
+        tk.Label(win, text="Overlay cards", font=FONT_SMALL_BOLD, bg=PANEL_BG, fg=FG,
+                 anchor="w").pack(fill="x", padx=10, pady=(10, 4))
+        self.overlay_card_vars = {}
+        for key, title in OVERLAY_CARDS:
+            var = tk.BooleanVar(value=self.overlay_card_visible.get(key, False))
+            cb = tk.Checkbutton(win, text=title, bg=PANEL_BG, fg=FG, selectcolor=BG,
+                                 activebackground=PANEL_BG, activeforeground=ACCENT,
+                                 font=FONT_SMALL, variable=var,
+                                 command=lambda k=key, v=var: self._set_overlay_card_visible(k, v.get()))
+            cb.pack(fill="x", padx=14, pady=2, anchor="w")
+            self.overlay_card_vars[key] = var
+        tk.Label(win, text="Unlock (🔒 button) to drag any card to move it, or its bottom-right "
+                            "corner (◢) to resize it.", font=FONT_SMALL, bg=PANEL_BG, fg=MUTED,
+                 justify="left", wraplength=220).pack(fill="x", padx=10, pady=(6, 4))
+        close_btn = tk.Label(win, text="Close", font=FONT_SMALL_BOLD, bg=CARD_BG, fg=ACCENT,
+                              cursor="hand2", padx=8, pady=3)
+        close_btn.pack(pady=(0, 10))
+        close_btn.bind("<Button-1>", lambda e: self._toggle_overlay_settings())
 
-        header = tk.Frame(content, bg=PANEL_BG)
-        header.pack(fill="x", padx=8, pady=(6, 2))
-        tk.Label(header, text="ELITE COMPANION", font=FONT_SMALL_BOLD, bg=PANEL_BG,
-                 fg=ACCENT).pack(side="left")
-        self.overlay_lock_hint_var = tk.StringVar(value="")
-        tk.Label(header, textvariable=self.overlay_lock_hint_var, font=FONT_SMALL, bg=PANEL_BG,
-                 fg=MUTED).pack(side="right")
+    def _toggle_overlay_settings(self):
+        win = self.overlay_settings_win
+        if win.winfo_viewable():
+            win.withdraw()
+            return
+        x = self.overlay_settings_btn.winfo_rootx()
+        y = self.overlay_settings_btn.winfo_rooty() + self.overlay_settings_btn.winfo_height()
+        win.geometry(f"+{x}+{y}")
+        win.deiconify()
+        win.lift()
+        self.overlay_settings_btn.config(fg=ACCENT, bg=CARD_BG)
 
-        self.overlay_status_var = tk.StringVar(value="--")
-        self.overlay_location_var = tk.StringVar(value="--")
-        self.overlay_suggestion_var = tk.StringVar(value="")
-        self.overlay_route_var = tk.StringVar(value="")
-        for var, color in ((self.overlay_status_var, FG), (self.overlay_location_var, MUTED),
-                            (self.overlay_suggestion_var, ACCENT), (self.overlay_route_var, MUTED)):
-            tk.Label(content, textvariable=var, font=FONT_SMALL, bg=PANEL_BG, fg=color,
-                     anchor="w", justify="left", wraplength=260).pack(fill="x", padx=8, pady=(0, 2))
-        tk.Frame(content, bg=PANEL_BG, height=6).pack()
-
-        # Drag-to-reposition only does anything while unlocked (interactive)
-        # — bind recursively on every descendant, not just direct children,
-        # since Tk doesn't bubble <Button-1> up to a parent's binding when a
-        # click lands on a child widget (e.g. the "ELITE COMPANION" label
-        # itself, not just the header frame's empty space around it).
-        def _bind_drag_recursive(widget):
-            widget.bind("<Button-1>", self._overlay_drag_start)
-            widget.bind("<B1-Motion>", self._overlay_drag_motion)
-            for child in widget.winfo_children():
-                _bind_drag_recursive(child)
-        _bind_drag_recursive(content)
-
-        set_overlay_click_through(win, True)
-
-    def _show_overlay(self):
-        self.overlay_visible = True
-        self.overlay_win.deiconify()
-        self.overlay_show_btn.config(fg=ACCENT, bg=CARD_BG)
-
-    def _hide_overlay(self):
-        self.overlay_visible = False
-        self.overlay_win.withdraw()
-        self.overlay_show_btn.config(fg=MUTED, bg=PANEL_BG)
-
-    def _toggle_overlay_visible(self):
-        if self.overlay_visible:
-            self._hide_overlay()
+    def _set_overlay_card_visible(self, key, visible):
+        self.overlay_card_visible[key] = visible
+        card = self.overlay_cards.get(key)
+        if not card:
+            return
+        if visible:
+            card.show()
         else:
-            self._show_overlay()
+            card.hide()
 
     def _toggle_overlay_lock(self):
         self.overlay_locked = not self.overlay_locked
-        set_overlay_click_through(self.overlay_win, self.overlay_locked)
+        for card in self.overlay_cards.values():
+            card.set_locked(self.overlay_locked)
         if self.overlay_locked:
             self.overlay_lock_btn.config(text="🔒", fg=MUTED)
-            self.overlay_lock_hint_var.set("")
         else:
             self.overlay_lock_btn.config(text="🔓", fg=ACCENT)
-            self.overlay_lock_hint_var.set("drag to move")
-
-    def _overlay_drag_start(self, event):
-        if self.overlay_locked:
-            return
-        self._overlay_drag_origin = (event.x_root, event.y_root,
-                                      self.overlay_win.winfo_x(), self.overlay_win.winfo_y())
-
-    def _overlay_drag_motion(self, event):
-        if self.overlay_locked or not self._overlay_drag_origin:
-            return
-        start_x, start_y, win_x, win_y = self._overlay_drag_origin
-        new_x = win_x + (event.x_root - start_x)
-        new_y = win_y + (event.y_root - start_y)
-        self.overlay_win.geometry(f"+{new_x}+{new_y}")
-        self.overlay_pos = f"+{new_x}+{new_y}"
 
     def _render_overlay(self, state):
-        if not self.overlay_visible or self.overlay_win is None:
+        if not self.overlay_cards:
             return
-        self.overlay_status_var.set(fmt_credits(state.get("credits")))
-        loc_bits = [b for b in (state.get("system"), state.get("station")) if b]
-        self.overlay_location_var.set(" — ".join(loc_bits) if loc_bits else "Location unknown")
-        self.overlay_suggestion_var.set(self.nav_suggestion_var.get() or "")
-
-        route_status, _route_error, route_result = self.route_plotter.get_snapshot()
-        if route_status == "done" and route_result:
-            jumps = route_result.get("system_jumps", [])
-            if len(jumps) > 1:
-                nxt = jumps[1]
-                self.overlay_route_var.set(
-                    f"Next: {nxt.get('system', '?')} ({nxt.get('jumps', 0)} jump(s))")
-            else:
-                self.overlay_route_var.set("")
-        else:
-            self.overlay_route_var.set("")
+        if "status" in self.overlay_cards:
+            self.overlay_cards["status"].set_text(fmt_credits(state.get("credits")))
+        if "location" in self.overlay_cards:
+            loc_bits = [b for b in (state.get("system"), state.get("station")) if b]
+            self.overlay_cards["location"].set_text(
+                " — ".join(loc_bits) if loc_bits else "Location unknown")
+        if "suggestion" in self.overlay_cards:
+            self.overlay_cards["suggestion"].set_text(self.nav_suggestion_var.get() or "No suggestion yet.")
+        if "route" in self.overlay_cards:
+            route_status, _route_error, route_result = self.route_plotter.get_snapshot()
+            text = ""
+            if route_status == "done" and route_result:
+                jumps = route_result.get("system_jumps", [])
+                if len(jumps) > 1:
+                    nxt = jumps[1]
+                    text = f"Next: {nxt.get('system', '?')} ({nxt.get('jumps', 0)} jump(s))"
+            self.overlay_cards["route"].set_text(text or "No active route.")
 
     # ---------- Tick ----------
 
