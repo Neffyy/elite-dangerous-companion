@@ -12,6 +12,7 @@ previewed before you've played a session.
 import copy
 import ctypes
 import json
+import math
 import os
 import re
 import threading
@@ -30,7 +31,7 @@ TICK_INTERVAL_MS = 1000
 # Bump both of these together whenever a real change is pushed to the repo —
 # the app compares its own APP_VERSION against the VERSION file living at
 # the repo root to know when a newer copy is available.
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 APP_REPO = "Neffyy/elite-dangerous-companion"
 APP_REPO_URL = f"https://github.com/{APP_REPO}"
 APP_VERSION_URL = f"https://raw.githubusercontent.com/{APP_REPO}/main/VERSION"
@@ -596,6 +597,92 @@ def ship_stat_score(ship, category):
             total += spec.get("class", 0) if isinstance(spec, dict) else (spec or 0)
         return total
     return 0
+
+
+# ---- Build tab stat calculator ----
+# Ported from EDCD/coriolis's src/app/shipyard/Calculations.js (MIT licensed
+# — confirmed via that repo's LICENSE.md; the *data* consumed by these
+# formulas is coriolis-data, separately confirmed MIT). This is a bounded
+# port covering core stats only (jump range, shield/hull HP, speed, weapon
+# DPS against a generic no-resistance target) — not the full opponent-vs-
+# armor-vs-resistance combat model Coriolis also implements, per an explicit
+# scope choice: that's a much larger, separate feature.
+
+def mass_curve_multiplier(mass, min_mass, opt_mass, max_mass, min_mul, opt_mul, max_mul):
+    """Port of the mass-vs-multiplier interpolation curve Coriolis's
+    shieldStrength() uses — the same curve shape also applies to thrusters'
+    speed multiplier (both module types carry the same minmass/optmass/
+    maxmass/minmul/optmul/maxmul fields in the real module data)."""
+    if max_mass <= min_mass or max_mul <= min_mul or max_mass <= 0:
+        return opt_mul
+    xnorm = min(1.0, (max_mass - mass) / (max_mass - min_mass))
+    denom_ratio = min(1.0, (max_mass - opt_mass) / (max_mass - min_mass))
+    if denom_ratio <= 0 or denom_ratio == 1:
+        return opt_mul
+    denom = math.log(denom_ratio)
+    if denom == 0 or xnorm <= 0:
+        return min_mul
+    exponent = math.log((opt_mul - min_mul) / (max_mul - min_mul)) / denom
+    ynorm = xnorm ** exponent
+    return min_mul + ynorm * (max_mul - min_mul)
+
+
+def compute_jump_range(mass, fsd_module, fuel=None):
+    """Port of Coriolis's jumpRange() (FSD booster contribution omitted —
+    guardian FSD boosters aren't modeled by this app's Build tab)."""
+    if not fsd_module or mass <= 0:
+        return 0.0
+    max_fuel_per_jump = fsd_module.get("maxfuel", 0)
+    opt_mass = fsd_module.get("optmass", 0)
+    fuel_mul = fsd_module.get("fuelmul", 0)
+    fuel_power = fsd_module.get("fuelpower", 1)
+    if fuel_mul <= 0 or max_fuel_per_jump <= 0:
+        return 0.0
+    used_fuel = min(fuel, max_fuel_per_jump) if fuel is not None else max_fuel_per_jump
+    return (used_fuel / fuel_mul) ** (1 / fuel_power) * opt_mass / mass
+
+
+def compute_shield_strength(mass, base_shield, sg_module, booster_multiplier_sum):
+    """Port of Coriolis's shieldStrength(). booster_multiplier_sum is the
+    sum of fitted shield boosters' real "shieldboost" values — Coriolis
+    applies a diminishing-returns curve on top for stacks of many boosters;
+    this simplified port skips that curve (additive only), so heavily
+    boosted loadouts will read a little higher than in-game."""
+    if not sg_module or mass <= 0:
+        return 0.0
+    mul = mass_curve_multiplier(mass, sg_module.get("minmass", 0), sg_module.get("optmass", 0),
+                                 sg_module.get("maxmass", 0), sg_module.get("minmul", 0),
+                                 sg_module.get("optmul", 0), sg_module.get("maxmul", 0))
+    return base_shield * mul * (1 + booster_multiplier_sum)
+
+
+def compute_speed(mass, base_speed, thruster_module):
+    """Port of Coriolis's speed() (base, unboosted, unengineered — matches
+    this app's non-engineering scope elsewhere in the Build tab)."""
+    if not thruster_module or mass <= 0:
+        return 0.0
+    mul = mass_curve_multiplier(mass, thruster_module.get("minmass", 0), thruster_module.get("optmass", 0),
+                                 thruster_module.get("maxmass", 0), thruster_module.get("minmul", 0),
+                                 thruster_module.get("optmul", 0), thruster_module.get("maxmul", 0))
+    return base_speed * mul
+
+
+def compute_weapon_dps(weapon_module):
+    """Real per-weapon DPS from coriolis-data's damage/fireint (and, for
+    ammo-limited weapons, clip/reload) fields. Heat/capacitor limits aren't
+    modeled — a laser's "sustained" number here assumes unlimited firing
+    time, which real heat buildup would cut short; ammo-based weapons
+    (multicannons, etc.) do account for their real reload downtime."""
+    damage = weapon_module.get("damage", 0)
+    fireint = weapon_module.get("fireint", 0)
+    if not damage or not fireint:
+        return 0.0
+    clip = weapon_module.get("clip")
+    reload = weapon_module.get("reload")
+    if clip and reload:
+        time_per_clip = clip * fireint
+        return (damage * clip) / (time_per_clip + reload)
+    return damage / fireint
 
 
 def estimate_tier(credits):
@@ -2986,6 +3073,16 @@ class App:
         use_current_btn.pack(side="left")
         use_current_btn.bind("<Button-1>", self._use_current_ship_for_build)
 
+        autofit_row = tk.Frame(top, bg=PANEL_BG)
+        autofit_row.pack(fill="x", padx=8, pady=(0, 3))
+        tk.Label(autofit_row, text="Auto-fit:", font=FONT_SMALL_BOLD, bg=PANEL_BG, fg=FG,
+                 width=8, anchor="w").pack(side="left")
+        for role, label in (("combat", "Combat"), ("hauler", "Hauler"), ("explorer", "Explorer")):
+            btn = tk.Label(autofit_row, text=label, font=FONT_SMALL_BOLD, bg=CARD_BG, fg=ACCENT,
+                            cursor="hand2", padx=8, pady=2)
+            btn.pack(side="left", padx=(0, 4))
+            btn.bind("<Button-1>", lambda e, r=role: self._auto_fit_build(r))
+
         self.build_status_var = tk.StringVar(value="Pick a ship to see its exact component slots.")
         tk.Label(top, textvariable=self.build_status_var, font=FONT_SMALL, bg=PANEL_BG, fg=MUTED,
                  anchor="w", justify="left", wraplength=440).pack(fill="x", padx=8, pady=(0, 8))
@@ -2994,10 +3091,21 @@ class App:
         tk.Label(inner, textvariable=self.build_summary_var, font=FONT_SMALL_BOLD, bg=BG, fg=FG,
                  anchor="w").pack(fill="x", padx=10, pady=(0, 2))
 
+        stats_box = tk.LabelFrame(inner, text=" Stats (approximate, unengineered) ", bg=BG, fg=MUTED,
+                                   labelanchor="nw", bd=1, relief="solid", highlightbackground="#2a2a2a")
+        stats_box.pack(fill="x", padx=10, pady=(2, 4))
+        self.build_stats_var = tk.StringVar(
+            value="Pick a ship and let its component data load to see computed stats.")
+        tk.Label(stats_box, textvariable=self.build_stats_var, font=FONT_SMALL, bg=BG, fg=FG,
+                 anchor="w", justify="left", wraplength=440).pack(fill="x", padx=8, pady=6)
+
         note = tk.Label(inner, text="Component data is fetched live from EDCD's coriolis-data "
                                      "(github.com/EDCD/coriolis-data) — requires an internet "
                                      "connection. Ownership compares against your equipped Journal "
-                                     "loadout and Storage; Engineer-unlock specifics aren't covered.",
+                                     "loadout and Storage; Engineer-unlock specifics aren't covered. "
+                                     "Stats are computed from real module data (ported from Coriolis's "
+                                     "own formulas) assuming full fuel and no cargo — not guaranteed "
+                                     "to exactly match in-game numbers.",
                          font=FONT_SMALL, bg=BG, fg=MUTED, anchor="w", justify="left", wraplength=460)
         note.pack(fill="x", padx=10, pady=(0, 4))
 
@@ -3184,6 +3292,129 @@ class App:
         owned_count = sum(1 for w in self.build_slot_widgets.values()
                            if w["tag_var"].get().startswith("✓"))
         self.build_summary_var.set(f"{owned_count} of {total} slots filled with modules you already own.")
+        self._render_build_stats()
+
+    def _compute_build_stats(self):
+        """Real computed stats for the currently selected build, using the
+        ported Coriolis formulas. Mass assumes full fuel and no cargo
+        (disclosed in the Build tab's note label) — not a live in-game
+        loadout snapshot."""
+        if not self.build_slug or not self.build_slot_widgets:
+            return None
+        wrapper = self.ship_store.get_ship(self.build_slug)
+        ship = wrapper.get(self.build_slug) if wrapper else None
+        if not ship:
+            return None
+        props = ship.get("properties", {})
+        total_mass = props.get("hullMass", 0) + props.get("reserveFuelCapacity", 0)
+
+        fsd_module = thruster_module = sg_module = None
+        booster_sum = 0.0
+        weapon_dps_total = 0.0
+
+        for slot_key, widgets in self.build_slot_widgets.items():
+            module = widgets["label_to_module"].get(widgets["var"].get())
+            if not module:
+                continue
+            total_mass += module.get("mass", 0)
+            if slot_key == "std:1":
+                thruster_module = module
+            elif slot_key == "std:2":
+                fsd_module = module
+            elif slot_key == "std:6":
+                total_mass += module.get("fuel", 0)  # fuel tank capacity, assumed full
+            grp = module.get("grp")
+            if grp == "sg":
+                sg_module = module
+            elif grp == "sb":
+                booster_sum += module.get("shieldboost", 0)
+            elif module.get("damage") and module.get("fireint"):
+                weapon_dps_total += compute_weapon_dps(module)
+
+        return {
+            "mass": total_mass,
+            "jump_range": compute_jump_range(total_mass, fsd_module) if fsd_module else None,
+            "shield": compute_shield_strength(total_mass, props.get("baseShieldStrength", 0),
+                                               sg_module, booster_sum) if sg_module else None,
+            "speed": compute_speed(total_mass, props.get("speed", 0), thruster_module) if thruster_module else None,
+            "boost": compute_speed(total_mass, props.get("boost", 0), thruster_module) if thruster_module else None,
+            "hull_hp": props.get("baseArmour", 0),
+            "dps": weapon_dps_total,
+        }
+
+    def _render_build_stats(self):
+        stats = self._compute_build_stats()
+        if not stats:
+            self.build_stats_var.set("Pick a ship and let its component data load to see computed stats.")
+            return
+        parts = [f"Mass: {stats['mass']:,.1f} t"]
+        if stats["jump_range"] is not None:
+            parts.append(f"Jump range: {stats['jump_range']:.2f} ly")
+        if stats["speed"] is not None:
+            parts.append(f"Speed: {stats['speed']:.0f} m/s (boost {stats['boost']:.0f} m/s)")
+        if stats["shield"] is not None:
+            parts.append(f"Shield: {stats['shield']:.0f} MJ")
+        parts.append(f"Hull: {stats['hull_hp']:.0f} HP")
+        if stats["dps"] > 0:
+            parts.append(f"Weapon DPS: {stats['dps']:.1f}")
+        self.build_stats_var.set("   •   ".join(parts))
+
+    def _auto_fit_build(self, role):
+        """Applies a small, disclosed set of real-module selection rules per
+        role — NOT a claimed community "meta" build (no citable public
+        source for that exists). Standard slots always go to the best
+        available rating; hardpoints/internals follow a simple per-role
+        group-code priority list, applied to whatever ship is currently
+        loaded in the Build tab."""
+        if not self.build_slot_widgets:
+            self.build_status_var.set("Pick a ship first.")
+            return
+        internal_priority = {
+            "combat": ["sg", "hr", "mrp"],
+            "hauler": ["cr"],
+            "explorer": ["fs", "dc"],
+        }.get(role, [])
+        utility_priority = {
+            "combat": ["sb"],
+            "hauler": ["ch"],
+            "explorer": ["hs"],
+        }.get(role, [])
+        used_internal_groups = set()
+
+        for slot_key, widgets in self.build_slot_widgets.items():
+            options = widgets["label_to_module"]
+            if not options:
+                continue
+            if slot_key.startswith("std:"):
+                best_label = next((l for l, m in options.items() if m.get("rating") == "A"), None)
+                if best_label:
+                    widgets["var"].set(best_label)
+            elif slot_key.startswith("hp:"):
+                weapon_options = [(l, m) for l, m in options.items() if m.get("mount")]
+                if weapon_options:
+                    if role == "hauler":
+                        continue  # leave weapon hardpoints alone on a cargo-focused build
+                    best_label, _ = max(weapon_options, key=lambda lm: compute_weapon_dps(lm[1]))
+                    widgets["var"].set(best_label)
+                else:
+                    for grp in utility_priority:
+                        match = next((l for l, m in options.items() if m.get("grp") == grp), None)
+                        if match:
+                            widgets["var"].set(match)
+                            break
+            elif slot_key.startswith("int:"):
+                for grp in internal_priority:
+                    if grp in used_internal_groups and grp != "cr":
+                        continue  # only fit one shield gen / one fuel scoop, but repeat cargo racks
+                    match = next((l for l, m in options.items() if m.get("grp") == grp), None)
+                    if match:
+                        widgets["var"].set(match)
+                        used_internal_groups.add(grp)
+                        break
+
+        self.build_status_var.set(
+            f"Auto-fit applied: {role.title()} role — real modules picked by a disclosed rule set, "
+            f"not a claimed community meta build.")
 
     # ---------- Explore tab ----------
 
