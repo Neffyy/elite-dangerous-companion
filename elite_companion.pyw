@@ -31,7 +31,7 @@ TICK_INTERVAL_MS = 1000
 # Bump both of these together whenever a real change is pushed to the repo —
 # the app compares its own APP_VERSION against the VERSION file living at
 # the repo root to know when a newer copy is available.
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.7.1"
 APP_REPO = "Neffyy/elite-dangerous-companion"
 APP_REPO_URL = f"https://github.com/{APP_REPO}"
 APP_VERSION_URL = f"https://raw.githubusercontent.com/{APP_REPO}/main/VERSION"
@@ -1739,7 +1739,6 @@ class Bar(tk.Frame):
                           highlightthickness=1, highlightbackground=CARD_BORDER)
         self.pack_propagate(False)
         self._width = width
-        self._height = height
         self.fill = tk.Frame(self, bg=ACCENT)
         self.fill.place(x=0, y=0, width=0, height=height)
 
@@ -2053,9 +2052,6 @@ class OverlayCard:
         header.pack(fill="x", padx=6, pady=(4, 2))
         tk.Label(header, text=title.upper(), font=FONT_SMALL_BOLD, bg=PANEL_BG,
                  fg=ACCENT).pack(side="left")
-        self.lock_hint_var = tk.StringVar(value="")
-        tk.Label(header, textvariable=self.lock_hint_var, font=FONT_SMALL, bg=PANEL_BG,
-                 fg=MUTED).pack(side="right")
 
         self.text_var = tk.StringVar(value="--")
         self.text_label = tk.Label(content, textvariable=self.text_var, font=FONT_SMALL,
@@ -2106,7 +2102,6 @@ class OverlayCard:
     def set_locked(self, locked):
         self.locked = locked
         set_overlay_click_through(self.win, locked)
-        self.lock_hint_var.set("" if locked else "drag · resize ◢")
 
     def show(self):
         self.win.deiconify()
@@ -2818,13 +2813,21 @@ class App:
         if panel:
             panel.flash_highlight()
 
-    def _render_recommendation(self, state):
-        credits = state.get("credits")
-        tier = estimate_tier(credits)
+    @staticmethod
+    def _current_recommendation(state):
+        """Shared by _render_recommendation (Guide tab banner) and
+        _render_nav_suggestion (Nav tab hub) — both want "what activity/tier
+        is this session earning toward" and previously recomputed it
+        independently from the same state every tick."""
+        tier = estimate_tier(state.get("credits"))
         buckets = state.get("buckets", {})
         positive = {k: v for k, v in buckets.items() if v > 0 and k in BUCKET_TO_PATH}
         dominant_bucket = max(positive, key=positive.get) if positive else None
         rec = recommend_path(tier, dominant_bucket)
+        return tier, dominant_bucket, rec
+
+    def _render_recommendation(self, state, tier, dominant_bucket, rec):
+        credits = state.get("credits")
         rec_key = rec["key"] if rec else None
 
         if rec_key != self._recommended_key:
@@ -3042,13 +3045,7 @@ class App:
         self.nav_dest_entry.delete(0, "end")
         self.nav_dest_entry.insert(0, self._suggested_hub)
 
-    def _render_nav_suggestion(self, state):
-        credits = state.get("credits")
-        tier = estimate_tier(credits)
-        buckets = state.get("buckets", {})
-        positive = {k: v for k, v in buckets.items() if v > 0 and k in BUCKET_TO_PATH}
-        dominant_bucket = max(positive, key=positive.get) if positive else None
-        rec = recommend_path(tier, dominant_bucket)
+    def _render_nav_suggestion(self, rec):
         hub = ACTIVITY_HUBS.get(rec["key"]) if rec else None
 
         if hub:
@@ -3394,20 +3391,39 @@ class App:
         var.trace_add("write", lambda *_a, k=slot_key: self._refresh_slot_ownership(k))
 
     def _refresh_build_ownership(self):
+        # Fetch state (a real deepcopy under JournalWatcher's lock) and build
+        # the owned-symbols set ONCE per call, not once per slot — this runs
+        # every tick while the Build tab has a ship loaded, and a ship can
+        # have 25+ slots, so per-slot fetching meant that many redundant
+        # deep-copies of the whole watcher state every second.
+        state, _ = self.watcher.get_snapshot()
+        owned = self._owned_module_symbols(state)
         for slot_key in self.build_slot_widgets:
-            self._refresh_slot_ownership(slot_key)
+            self._refresh_slot_ownership(slot_key, owned)
         self._update_build_summary()
 
-    def _refresh_slot_ownership(self, slot_key):
+    @staticmethod
+    def _owned_module_symbols(state):
+        owned = {v.lower() for v in state.get("equipped_modules", {}).values()}
+        owned |= {s.lower() for s in state.get("stored_modules", set())}
+        return owned
+
+    def _refresh_slot_ownership(self, slot_key, owned=None):
+        """owned is an optional pre-computed set from _refresh_build_ownership
+        (the per-tick bulk path); when called alone — the dropdown's own
+        trace_add callback on a manual selection change — it fetches fresh
+        state itself and also refreshes the summary line, since nothing else
+        will."""
         widgets = self.build_slot_widgets.get(slot_key)
         if not widgets:
             return
         symbol = widgets["label_to_symbol"].get(widgets["var"].get())
         if not symbol:
             return
-        state, _ = self.watcher.get_snapshot()
-        owned = {v.lower() for v in state.get("equipped_modules", {}).values()}
-        owned |= {s.lower() for s in state.get("stored_modules", set())}
+        standalone_call = owned is None
+        if standalone_call:
+            state, _ = self.watcher.get_snapshot()
+            owned = self._owned_module_symbols(state)
         is_owned = symbol.lower() in owned
         if is_owned:
             widgets["tag_var"].set("✓ Owned")
@@ -3418,7 +3434,8 @@ class App:
             widgets["tag_label"].config(fg=WARN)
             module = widgets["label_to_module"].get(widgets["var"].get(), {})
             widgets["note_var"].set(acquisition_note(symbol, module))
-        self._update_build_summary()
+        if standalone_call:
+            self._update_build_summary()
 
     def _update_build_summary(self):
         if not self.build_slot_widgets:
@@ -3966,15 +3983,21 @@ class App:
     def _render_overlay(self, state):
         if not self.overlay_cards:
             return
-        if "status" in self.overlay_cards:
+        # Skip a card's own work entirely while hidden — no point formatting
+        # text or (for "route") taking a finder lock for a window nobody
+        # can see, every second.
+        def visible(key):
+            return self.overlay_card_visible.get(key) and key in self.overlay_cards
+
+        if visible("status"):
             self.overlay_cards["status"].set_text(fmt_credits(state.get("credits")))
-        if "location" in self.overlay_cards:
+        if visible("location"):
             loc_bits = [b for b in (state.get("system"), state.get("station")) if b]
             self.overlay_cards["location"].set_text(
                 " — ".join(loc_bits) if loc_bits else "Location unknown")
-        if "suggestion" in self.overlay_cards:
+        if visible("suggestion"):
             self.overlay_cards["suggestion"].set_text(self.nav_suggestion_var.get() or "No suggestion yet.")
-        if "route" in self.overlay_cards:
+        if visible("route"):
             route_status, _route_error, route_result = self.route_plotter.get_snapshot()
             text = ""
             if route_status == "done" and route_result:
@@ -4044,8 +4067,9 @@ class App:
             self._nav_last_status = route_status
             self._render_route(route_status, route_error, route_result)
 
-        self._render_recommendation(state)
-        self._render_nav_suggestion(state)
+        tier, dominant_bucket, rec = self._current_recommendation(state)
+        self._render_recommendation(state, tier, dominant_bucket, rec)
+        self._render_nav_suggestion(rec)
         self._poll_personalization()
         self._render_colonization(state.get("colonization_depots", {}))
 
