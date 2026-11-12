@@ -31,7 +31,7 @@ TICK_INTERVAL_MS = 1000
 # Bump both of these together whenever a real change is pushed to the repo —
 # the app compares its own APP_VERSION against the VERSION file living at
 # the repo root to know when a newer copy is available.
-APP_VERSION = "1.7.1"
+APP_VERSION = "1.8.0"
 APP_REPO = "Neffyy/elite-dangerous-companion"
 APP_REPO_URL = f"https://github.com/{APP_REPO}"
 APP_VERSION_URL = f"https://raw.githubusercontent.com/{APP_REPO}/main/VERSION"
@@ -215,6 +215,12 @@ SHIP_SLUGS = {
     "anaconda": "anaconda", "cutter": "imperial_cutter", "mamba": "mamba",
     "krait_mkii": "krait_mkii", "krait_light": "krait_phantom",
     "mandalay": "mandalay",
+    # Added after checking coriolis-data against the roster (journal names
+    # from EDCD/FDevIDs shipyard.csv).
+    "cobramkv": "cobra_mk_v", "corsair": "imperial_corsair",
+    "panthermkii": "panther_clipper", "type8": "type_8_transport",
+    "lakonminer": "type_11_prospector", "explorer_nx": "explorer_nx",
+    "smallcombat01_nx": "kestrel",
 }
 
 # Standard (core) slots are always these 7 categories in this fixed order.
@@ -320,6 +326,10 @@ SHIP_NAMES = {
     "anaconda": "Anaconda", "cutter": "Imperial Cutter", "mamba": "Mamba",
     "krait_mkii": "Krait Mk II", "krait_light": "Krait Phantom",
     "mandalay": "Mandalay",
+    "cobramkv": "Cobra Mk V", "corsair": "Corsair",
+    "panthermkii": "Panther Clipper Mk II", "type8": "Type-8 Transporter",
+    "lakonminer": "Type-11 Prospector", "explorer_nx": "Caspian Explorer",
+    "smallcombat01_nx": "Kestrel Mk II",
 }
 
 PATHS = [
@@ -603,7 +613,10 @@ def ship_stat_score(ship, category):
         standard = slots.get("standard") or []
         return standard[2] if len(standard) > 2 else 0
     if category == "hardpoint":
-        return sum(slots.get("hardpoints") or [])
+        # Some ships (Type-11 Prospector) have restricted mining hardpoints
+        # stored as {"class": n, "eligible": {...}} instead of a bare size.
+        return sum(h.get("class", 0) if isinstance(h, dict) else (h or 0)
+                   for h in slots.get("hardpoints") or [])
     if category == "cargo":
         total = 0
         for spec in slots.get("internal") or []:
@@ -1696,6 +1709,11 @@ class ShipDataStore:
             self.error = None
         try:
             ship = _fetch_json(f"{CORIOLIS_RAW_BASE}ships/{slug}.json")
+            # Callers read ship[slug], but a few coriolis-data files key their
+            # content differently from the filename (cobra_mk_v.json is keyed
+            # "cobramkv", panther_clipper.json "panthermkii") — re-key by slug.
+            if isinstance(ship, dict) and slug not in ship and len(ship) == 1:
+                ship = {slug: next(iter(ship.values()))}
             with self.lock:
                 self.ships[slug] = ship
 
@@ -3295,12 +3313,18 @@ class App:
             type_name = display_name_for_file(fname)
             for m in self.ship_store.get_modules("hardpoints", fname):
                 catalog.append((type_name, m))
-        for i, size in enumerate(sizes):
-            mods = [(t, m) for t, m in catalog if fits_hardpoint(m.get("class", -1), size)]
+        for i, spec in enumerate(sizes):
+            if isinstance(spec, dict):  # restricted slot, e.g. Type-11 mining hardpoints
+                size, eligible, slot_name = spec.get("class", 0), spec.get("eligible"), spec.get("name")
+            else:
+                size, eligible, slot_name = spec, None, None
+            mods = [(t, m) for t, m in catalog if fits_hardpoint(m.get("class", -1), size)
+                    and (not eligible or m.get("grp") in eligible)]
             mods.sort(key=lambda tm: (tm[0], tm[1].get("class", 0), RATING_ORDER.get(tm[1].get("rating"), 9)))
             options = [(module_option_label(t, m), m["symbol"], m) for t, m in mods]
             size_name = HARDPOINT_SIZE_NAMES[size] if 0 <= size < len(HARDPOINT_SIZE_NAMES) else f"Size {size}"
-            rows.append((f"hp:{i}", f"{size_name} Hardpoint {i + 1}", options))
+            label = f"{slot_name} {size_name} Hardpoint {i + 1}" if slot_name else f"{size_name} Hardpoint {i + 1}"
+            rows.append((f"hp:{i}", label, options))
         return rows
 
     def _internal_slot_rows(self, ship):
